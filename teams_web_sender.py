@@ -27,7 +27,7 @@ LAST_REPLIED_FILE = Path(__file__).parent / ".last_replied_msg"
 VN_TZ = timezone(timedelta(hours=7))
 
 # Trigger keywords/names when someone tags or asks the bot in chat
-BOT_TRIGGERS = ["@weather", "weather bot", "!weather", "/weather", "thời tiết", "thoi tiet"]
+BOT_TRIGGERS = ["@weather", "weather b", "weather bot", "!weather", "/weather", "thời tiết", "thoi tiet"]
 
 
 def start_health_server() -> None:
@@ -105,7 +105,7 @@ def filter_locations_from_query(text: str) -> list:
 def is_vitamin_sea_command(msg_text: str) -> bool:
     """Check if a chat message requests !vitaminSea."""
     lower = msg_text.lower().strip()
-    if "🌊 vitamin sea" in lower:
+    if "🌊 vitamin" in lower or "tiếp thêm năng lượng code" in lower:
         return False
     return any(cmd in lower for cmd in ["!vitaminsea", "/vitaminsea", "!vitamin", "!girl"])
 
@@ -139,55 +139,65 @@ def _record_seen_photo(url: str, img_bytes: bytes, seen: set[str]) -> None:
 
 
 def fetch_vitamin_sea_photo(context=None) -> tuple[bytes, str]:
-    """Fetch a unique, unseen random photo from the VOZ Vitamin Gái Xinh thread (783806)."""
+    """Fetch a unique, unseen random photo from the VOZ Vitamin Gái Xinh thread (783806) with multi-source fallbacks."""
     import json
     import random
     import urllib.request
 
     seen = _load_seen_photos()
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer": "https://voz.vn/",
     }
 
-    # 1. Primary source: VOZ Thread 783806 via Playwright browser tab (checks up to 4 random pages for an unseen photo)
+    # 1. Primary source: VOZ Thread 783806 via Playwright browser tab (checks up to 3 random pages for an unseen photo)
     if context is not None:
         voz_page = None
         try:
             voz_page = context.new_page()
-            for _attempt in range(4):
-                random_page = random.randint(1, 350)
+            for _attempt in range(3):
+                random_page = random.randint(240, 360)
                 target_url = f"{VOZ_THREAD_URL}/page-{random_page}"
-                voz_page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
-                voz_page.wait_for_timeout(2000)
+                voz_page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                voz_page.wait_for_timeout(1500)
 
                 img_urls = voz_page.evaluate(
                     """() => {
-                        const imgs = Array.from(document.querySelectorAll('.message-body .bbWrapper img'));
-                        return [...new Set(imgs
-                            .map(img => img.getAttribute('data-url') || img.getAttribute('data-src') || img.src || '')
-                            .filter(u => u.startsWith('http')
-                                && !u.includes('/smilies/')
-                                && !u.includes('/avatars/')
-                                && !u.includes('twemoji')
-                                && !u.includes('reactions')
-                                && !u.endsWith('.gif')
-                                && !u.endsWith('.svg')))];
+                        const raw = [];
+                        document.querySelectorAll('.message-body .bbWrapper img').forEach(img => {
+                            const u = img.getAttribute('data-url') || img.getAttribute('data-src') || img.getAttribute('src') || img.src || '';
+                            if (u) raw.push(u);
+                        });
+                        document.querySelectorAll('.message-body .bbWrapper a.js-lbImage').forEach(a => {
+                            const u = a.getAttribute('href') || '';
+                            if (u) raw.push(u);
+                        });
+                        const resolved = raw.map(u => {
+                            try { return new URL(u, document.baseURI).href; } catch (e) { return ''; }
+                        });
+                        return [...new Set(resolved.filter(u =>
+                            u.startsWith('http')
+                            && !u.includes('/smilies/')
+                            && !u.includes('/avatars/')
+                            && !u.includes('twemoji')
+                            && !u.includes('reactions')
+                            && !u.includes('data:image')
+                            && !u.endsWith('.gif')
+                            && !u.endsWith('.svg')
+                        ))];
                     }"""
                 )
-                # Filter out already-seen URLs
                 unseen_urls = [u for u in img_urls if u not in seen]
                 if unseen_urls:
                     random.shuffle(unseen_urls)
                     for candidate_url in unseen_urls[:8]:
                         try:
                             resp = voz_page.request.get(
-                                candidate_url, headers={"Referer": "https://voz.vn/"}, timeout=15000
+                                candidate_url, headers={"Referer": "https://voz.vn/"}, timeout=12000
                             )
                             if resp.ok:
                                 body = resp.body()
                                 img_hash = hashlib.sha256(body).hexdigest()[:24]
-                                # Check both size (>15 KB) AND content SHA-256 (skips quoted/re-uploaded duplicates!)
                                 if len(body) > 15000 and img_hash not in seen:
                                     _record_seen_photo(candidate_url, body, seen)
                                     voz_page.close()
@@ -203,29 +213,61 @@ def fetch_vitamin_sea_photo(context=None) -> tuple[bytes, str]:
                 except Exception:
                     pass
 
-    # 2. Fallback if Cloudflare blocks datacenter IP (also deduplicated by URL + SHA-256)
-    queries = [
-        "asian+woman+beach+summer+portrait",
-        "korean+girl+beach+vacation+portrait",
-        "vietnam+girl+summer+portrait",
+    # 2. Secondary source: Bing Images async search for VOZ / Vietnamese Vitamin Gái Xinh (works even when Cloudflare blocks VOZ)
+    bing_queries = [
+        "gai+xinh+viet+nam+voz+portrait",
+        "vitamin+gai+xinh+viet+nam+trong+sang",
+        "hot+girl+viet+nam+ao+dai+portrait",
+        "gai+xinh+han+quoc+ulzzang+portrait",
     ]
-    q = random.choice(queries)
-    page_num = random.randint(1, 10)
-    try:
-        search_url = f"https://unsplash.com/napi/search/photos?query={q}&per_page=30&page={page_num}"
-        req = urllib.request.Request(search_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            results = data.get("results", [])
-            random.shuffle(results)
-            for item in results:
-                candidate_url = item.get("urls", {}).get("regular", "")
-                if candidate_url and candidate_url not in seen:
-                    img_req = urllib.request.Request(candidate_url, headers=headers)
-                    with urllib.request.urlopen(img_req, timeout=15) as img_resp:
+    random.shuffle(bing_queries)
+    for q in bing_queries[:2]:
+        try:
+            offset = random.randint(1, 80)
+            bing_url = f"https://www.bing.com/images/async?q={q}&first={offset}&count=35&adlt=moderate"
+            req = urllib.request.Request(
+                bing_url,
+                headers={"User-Agent": headers["User-Agent"], "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            candidates = re.findall(r"murl&quot;:&quot;(https://[^&]+?)&quot;", html, flags=re.IGNORECASE)
+            unseen_candidates = [
+                u for u in candidates
+                if u not in seen and not u.lower().endswith((".gif", ".svg", ".webp"))
+            ]
+            random.shuffle(unseen_candidates)
+            for candidate_url in unseen_candidates[:10]:
+                try:
+                    img_req = urllib.request.Request(candidate_url, headers={"User-Agent": headers["User-Agent"]})
+                    with urllib.request.urlopen(img_req, timeout=10) as img_resp:
+                        ctype = img_resp.headers.get("Content-Type", "")
                         body = img_resp.read()
                         img_hash = hashlib.sha256(body).hexdigest()[:24]
-                        if img_hash not in seen:
+                        if "image" in ctype and len(body) > 15000 and img_hash not in seen:
+                            _record_seen_photo(candidate_url, body, seen)
+                            return body, candidate_url
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # 3. Tertiary source: Wallhaven API (SFW portrait / model photography)
+    try:
+        wh_url = "https://wallhaven.cc/api/v1/search?q=asian+girl&categories=001&purity=100&sorting=random"
+        req = urllib.request.Request(wh_url, headers={"User-Agent": headers["User-Agent"]})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            items = data.get("data", [])
+            random.shuffle(items)
+            for item in items:
+                candidate_url = item.get("path", "")
+                if candidate_url and candidate_url not in seen:
+                    img_req = urllib.request.Request(candidate_url, headers={"User-Agent": headers["User-Agent"]})
+                    with urllib.request.urlopen(img_req, timeout=12) as img_resp:
+                        body = img_resp.read()
+                        img_hash = hashlib.sha256(body).hexdigest()[:24]
+                        if len(body) > 15000 and img_hash not in seen:
                             _record_seen_photo(candidate_url, body, seen)
                             return body, candidate_url
     except Exception:
@@ -235,9 +277,19 @@ def fetch_vitamin_sea_photo(context=None) -> tuple[bytes, str]:
 
 
 def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
-    """Paste an image directly into the Teams chat compose box and send it inline with a caption."""
+    """Paste an image directly into the Teams chat compose box and click the Send button."""
     compose = page.locator('[role="textbox"][contenteditable="true"]').first
     compose.click(timeout=20000)
+
+    # Discard any stuck leftover draft in the compose box first
+    try:
+        discard = page.locator('[data-tid="newMessageCommands-discard-draft"]')
+        if discard.count() > 0 and discard.first.is_visible():
+            discard.first.click(timeout=3000)
+            page.wait_for_timeout(800)
+            compose.click(timeout=10000)
+    except Exception:
+        pass
 
     b64_img = base64.b64encode(img_bytes).decode("ascii")
     # Dispatch a synthetic paste event with image/jpeg File in DataTransfer
@@ -258,10 +310,19 @@ def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
         }""",
         b64_img,
     )
-    # Wait for Teams Web to upload & attach the pasted image thumbnail
-    page.wait_for_timeout(4500)
+    # Wait for Teams Web CKEditor to attach the inlineimage blob
+    page.wait_for_timeout(3500)
+    compose.click(timeout=10000)
     page.keyboard.insert_text(caption)
-    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+
+    # When an inline image is present, Teams Web requires clicking newMessageCommands-send (or Ctrl+Enter) instead of plain Enter
+    send_btn = page.locator('[data-tid="newMessageCommands-send"]')
+    if send_btn.count() > 0:
+        send_btn.first.click(timeout=10000)
+    else:
+        page.keyboard.press("Control+Enter")
+        page.keyboard.press("Enter")
     page.wait_for_timeout(3000)
 
 
@@ -278,8 +339,36 @@ def _send_text_in_page(page, message: str) -> None:
     page.wait_for_timeout(2500)
 
 
-def _get_latest_chat_message(page) -> tuple[str, str]:
-    """Return (msg_hash, msg_text) of the most recent message in the currently open Teams chat."""
+def _get_latest_chat_message(page, chat_name: str = "") -> tuple[str, str]:
+    """Scroll to the bottom of the Teams chat and return (msg_hash, msg_text) of the newest message."""
+    # 1. Scroll virtualized chat list and all scrollable ancestors to the bottom so Teams mounts the newest message
+    try:
+        page.evaluate(
+            """() => {
+                document.querySelectorAll('[data-tid*="message-pane"], [data-tid*="virtual"], [role="log"], .fui-Chat').forEach(el => {
+                    el.scrollTop = el.scrollHeight;
+                });
+                const msgs = document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body');
+                if (msgs.length > 0) {
+                    const last = msgs[msgs.length - 1];
+                    last.scrollIntoView({ block: 'end' });
+                    let p = last.parentElement;
+                    while (p) {
+                        if (p.scrollHeight > p.clientHeight) {
+                            p.scrollTop = p.scrollHeight;
+                        }
+                        p = p.parentElement;
+                    }
+                }
+                const jumpBtn = document.querySelector('[data-tid*="jump-to-bottom"], [data-tid*="new-messages"], button[aria-label*="new message"]');
+                if (jumpBtn) jumpBtn.click();
+            }"""
+        )
+    except Exception:
+        pass
+
+    pane_text = ""
+    pane_count = 0
     selectors = [
         '[data-tid="chat-pane-message"]',
         '[data-tid="messageBodyContent"]',
@@ -289,15 +378,52 @@ def _get_latest_chat_message(page) -> tuple[str, str]:
         loc = page.locator(sel)
         count = loc.count()
         if count > 0:
-            last_text = loc.nth(count - 1).inner_text(timeout=5000).strip()
-            if last_text:
-                msg_hash = hashlib.sha256(f"{count}:{last_text}".encode("utf-8")).hexdigest()[:16]
-                return msg_hash, last_text
+            pane_count = count
+            pane_text = loc.nth(count - 1).inner_text(timeout=5000).strip()
+            if pane_text:
+                break
+
+    # 2. Check the left sidebar chat preview (which ALWAYS updates in real time on every new message, including our bot's own reply!)
+    sidebar_text = ""
+    if chat_name:
+        try:
+            items = page.locator('[role="treeitem"]')
+            for i in range(min(items.count(), 12)):
+                t = items.nth(i).inner_text(timeout=2000).strip()
+                if chat_name.lower() in t.lower():
+                    lines = [
+                        ln.strip()
+                        for ln in t.splitlines()
+                        if ln.strip()
+                        and ln.strip().lower() != "unread"
+                        and not re.match(r"^(\d{1,2}:\d{2}(\s*[AP]M)?|just now|yesterday)$", ln.strip(), flags=re.IGNORECASE)
+                    ]
+                    for idx, ln in enumerate(lines):
+                        if chat_name.lower() in ln.lower():
+                            # Take the message preview line immediately following the chat title
+                            preview_lines = lines[idx + 1 : idx + 2]
+                            sidebar_text = " ".join(preview_lines).strip()
+                            break
+                    if sidebar_text:
+                        break
+        except Exception:
+            pass
+
+    # Always prefer sidebar_text when available so that when the bot replies ("You: 🌊 Vitamin..."),
+    # msg_hash changes to the bot's reply hash, allowing the very next !girl command to be detected as new!
+    if sidebar_text:
+        msg_hash = hashlib.sha256(f"sidebar:{sidebar_text}".encode("utf-8")).hexdigest()[:16]
+        return msg_hash, sidebar_text
+
+    if pane_text:
+        msg_hash = hashlib.sha256(f"{pane_count}:{pane_text}".encode("utf-8")).hexdigest()[:16]
+        return msg_hash, pane_text
+
     return "", ""
 
 
 def export_compact_secret() -> str:
-    """Strip temporary React cache keys and gzip-compress teams_session.json so it easily fits in GitHub Secrets (<22 KB)."""
+    """Keep all Teams auth/session keys and only strip large non-chat caches so it fits in GitHub Secrets (<47 KB)."""
     import gzip
     import json
 
@@ -305,6 +431,20 @@ def export_compact_secret() -> str:
         print(f"ERROR: {SESSION_FILE} not found. Run --login first.", file=sys.stderr)
         sys.exit(1)
 
+    skip_substrings = (
+        "CDLSupportedResolvers",
+        "policy-cache",
+        "previousLoaderDiagnostics",
+        "pendingSettingsForMigration",
+        "M365COPILOTAPP",
+        "m365copilotapp",
+        "AUGLOOP",
+        "augloop",
+        "CONSENTSERVICE",
+        "consentservice",
+        "LIVEPROFILECARD",
+        "liveprofilecard",
+    )
     data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
     slim_data = {
         "cookies": data.get("cookies", []),
@@ -314,7 +454,7 @@ def export_compact_secret() -> str:
                 "localStorage": [
                     x
                     for x in o.get("localStorage", [])
-                    if not x["name"].startswith("tmp.") and "|accesstoken|" not in x["name"]
+                    if not any(s in x["name"] for s in skip_substrings)
                 ],
             }
             for o in data.get("origins", [])
@@ -326,7 +466,7 @@ def export_compact_secret() -> str:
 
     out_path = SESSION_FILE.parent / "teams_session_b64.txt"
     out_path.write_text(b64_str, encoding="utf-8")
-    print(f"✅ Generated compact secret ({len(b64_str)} chars, down from ~229,000 chars)!")
+    print(f"✅ Generated compact secret ({len(b64_str)} chars, <48 KB limit)!")
     print(f"📄 Saved to: {out_path}")
     return b64_str
 
@@ -337,7 +477,7 @@ def save_login_session() -> None:
 
     print("Opening browser to https://teams.live.com ...")
     print("1. Log in with your free @outlook.com Weather Bot account.")
-    print("2. Wait until your Teams chat list finishes loading.")
+    print("2. Click into your target Group Chat so it is open on screen.")
     print("3. Come back to this terminal and press ENTER to save the session.")
 
     with sync_playwright() as p:
@@ -345,7 +485,7 @@ def save_login_session() -> None:
         context = browser.new_context()
         page = context.new_page()
         page.goto("https://teams.live.com")
-        input("\n>>> Press ENTER here AFTER Teams chats have loaded in the browser... ")
+        input("\n>>> Press ENTER here AFTER you have clicked into your Teams chat... ")
         context.storage_state(path=str(SESSION_FILE))
         browser.close()
 
@@ -359,13 +499,39 @@ def _ensure_session_file() -> None:
     env_b64 = os.environ.get("TEAMS_SESSION_B64", "").strip()
     if env_b64:
         raw = base64.b64decode(env_b64)
-        # Automatically decompress if gzipped (starts with 0x1f 0x8b)
         if raw[:2] == b"\x1f\x8b":
             raw = gzip.decompress(raw)
         SESSION_FILE.write_bytes(raw)
     if not SESSION_FILE.exists():
         print("ERROR: Session file not found. Run `python3 teams_web_sender.py --login` once first.", file=sys.stderr)
         sys.exit(1)
+
+
+def _open_target_chat(page, chat_name: str) -> None:
+    """Wait for Teams Web to load and select chat_name (or use the already-open active chat from session)."""
+    print("⏳ Waiting for Teams Web interface to load...")
+    page.wait_for_timeout(8000)
+
+    if chat_name:
+        try:
+            page.get_by_text(chat_name, exact=False).first.click(timeout=15000)
+            print(f"✅ Clicked chat matching '{chat_name}'")
+            page.wait_for_timeout(2000)
+            return
+        except Exception:
+            print(f"ℹ️ Could not find chat title '{chat_name}' in sidebar; checking if chat compose box is already open...")
+
+    # Check if compose box is already active (Teams remembers last open chat 19:1ed6928a...@thread.v2 in localStorage!)
+    compose = page.locator('[role="textbox"][contenteditable="true"]')
+    if compose.count() > 0:
+        print("✅ Active chat compose box is already open!")
+        return
+
+    # Otherwise click the first chat item in the left sidebar
+    first_chat = page.locator('[role="treeitem"], [data-tid*="chat-list-item"]').first
+    first_chat.click(timeout=15000)
+    page.wait_for_timeout(2000)
+    print("✅ Clicked first chat in sidebar!")
 
 
 def send_via_teams_web(chat_name: str, message: str) -> None:
@@ -380,12 +546,12 @@ def send_via_teams_web(chat_name: str, message: str) -> None:
         page = context.new_page()
         page.goto("https://teams.live.com", wait_until="domcontentloaded", timeout=60000)
 
-        page.get_by_text(chat_name, exact=False).first.click(timeout=45000)
+        _open_target_chat(page, chat_name)
         _send_text_in_page(page, message)
 
         context.storage_state(path=str(SESSION_FILE))
         browser.close()
-        print(f"✅ Successfully sent TTC & FPT Software weather alert to chat '{chat_name}'!")
+        print(f"✅ Successfully sent TTC & FPT Software weather alert to chat!")
 
 
 def listen_for_mentions(
@@ -395,6 +561,7 @@ def listen_for_mentions(
     poll_interval: int = 3,
     start_server: bool = True,
     max_minutes: int = 0,
+    headless: bool = True,
 ) -> None:
     """Watch the Teams chat 24/7: reply to @mentions AND auto-send rain alerts during work hours."""
     from playwright.sync_api import sync_playwright
@@ -404,29 +571,37 @@ def listen_for_mentions(
         start_health_server()
 
     last_replied = LAST_REPLIED_FILE.read_text().strip() if LAST_REPLIED_FILE.exists() else ""
-    last_auto_alert_ts = 0.0
+    # Initialize to current time so starting --listen doesn't immediately trigger a redundant commute check
+    last_auto_alert_ts = time.time()
     last_vitamin_ts = 0.0
-    vitamin_cooldown_sec = int(os.environ.get("VITAMIN_COOLDOWN_SEC", "60"))
+    vitamin_cooldown_sec = int(os.environ.get("VITAMIN_COOLDOWN_SEC", "15"))
     start_ts = time.time()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=str(SESSION_FILE))
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            storage_state=str(SESSION_FILE),
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
         page = context.new_page()
         page.goto("https://teams.live.com", wait_until="domcontentloaded", timeout=60000)
-        page.get_by_text(chat_name, exact=False).first.click(timeout=45000)
-        page.wait_for_timeout(3000)
+        _open_target_chat(page, chat_name)
 
         print(
-            f"👂 Listening for @mentions ('{bot_name}', !weather, !vitaminSea) in '{chat_name}'..."
+            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !vitaminSea)..."
             if not one_shot
-            else f"🔍 Checking for new @mentions in chat '{chat_name}'..."
+            else f"🔍 Checking for new @mentions..."
         )
+        _, initial_msg = _get_latest_chat_message(page, chat_name)
+        print(f"💬 Latest message currently visible in chat: {initial_msg[:120]!r}")
 
         while True:
             try:
-                # 1. Check if someone typed !vitaminSea or tagged @Weather Bot in the chat
-                msg_hash, msg_text = _get_latest_chat_message(page)
+                # 1. Check if someone typed !vitaminSea / !girl or tagged @Weather Bot in the chat
+                msg_hash, msg_text = _get_latest_chat_message(page, chat_name)
                 if msg_hash and msg_hash != last_replied:
                     if is_vitamin_sea_command(msg_text):
                         elapsed = time.time() - last_vitamin_ts
@@ -436,35 +611,47 @@ def listen_for_mentions(
                             last_replied = msg_hash
                             LAST_REPLIED_FILE.write_text(last_replied)
                         else:
-                            print(f"[{datetime.now(VN_TZ).isoformat()}] 🌊 Detected !vitaminSea command: {msg_text!r}")
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] 🌊 Detected !girl / !vitaminSea command: {msg_text!r}")
+                            last_replied = msg_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
                             img_bytes, img_url = fetch_vitamin_sea_photo(context)
                             caption = "🌊 Vitamin Gái Xinh VOZ tiếp thêm năng lượng code cho anh em! ✨"
                             _send_image_in_page(page, img_bytes, caption)
                             last_vitamin_ts = time.time()
-                            last_replied = msg_hash
-                            LAST_REPLIED_FILE.write_text(last_replied)
+                            # Update last_replied to our sent reply so the next !girl from the same user has a new msg_hash
+                            new_hash, _ = _get_latest_chat_message(page, chat_name)
+                            if new_hash:
+                                last_replied = new_hash
+                                LAST_REPLIED_FILE.write_text(last_replied)
                             print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent VOZ photo ({img_url})!")
                     elif is_bot_mentioned(msg_text, bot_name):
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🔔 Detected bot tag: {msg_text!r}")
+                        last_replied = msg_hash
+                        LAST_REPLIED_FILE.write_text(last_replied)
                         locs = filter_locations_from_query(msg_text)
                         results = fetch_all_locations(locs)
                         reply = format_multi_location_message(results, triggered_by="On-demand reply")
                         _send_text_in_page(page, reply)
-
+                        new_hash, _ = _get_latest_chat_message(page, chat_name)
+                        if new_hash:
+                            last_replied = new_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                        print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Replied with live weather!")
+                    else:
+                        # Update last_replied when a normal message or our own bot reply becomes the latest message
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
-                        print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Replied with live weather!")
 
                 # 2. Automatic rain check during commute hours (07:00-08:30 and 16:00-17:30 VN time, Mon-Fri)
                 now_vn = datetime.now(VN_TZ)
                 is_weekday = now_vn.weekday() < 5
                 is_commute_window = (7 <= now_vn.hour <= 8) or (16 <= now_vn.hour <= 17)
                 if not one_shot and is_weekday and is_commute_window and (time.time() - last_auto_alert_ts > 4 * 3600):
+                    last_auto_alert_ts = time.time()
                     results = fetch_all_locations(LOCATIONS)
                     if any(r["analysis"]["is_alert"] for r in results):
                         alert_msg = format_multi_location_message(results, triggered_by="Commute Rain Alert")
                         _send_text_in_page(page, alert_msg)
-                        last_auto_alert_ts = time.time()
 
             except KeyboardInterrupt:
                 break
@@ -485,10 +672,11 @@ def listen_for_mentions(
 def main():
     parser = argparse.ArgumentParser(description="Send TTC & FPT Software Weather Alert & Reply to @Mentions")
     parser.add_argument("--login", action="store_true", help="Log in once interactively to save session")
-    parser.add_argument("--export-secret", action="store_true", help="Export compact <22KB base64 secret from existing teams_session.json")
-    parser.add_argument("--chat-name", default=os.environ.get("TEAMS_CHAT_NAME", ""), help="Name of the Teams Group Chat")
-    parser.add_argument("--bot-name", default=os.environ.get("TEAMS_BOT_NAME", "Weather Bot"), help="Display name of your bot account when @mentioned")
+    parser.add_argument("--export-secret", action="store_true", help="Export compact <48KB base64 secret from existing teams_session.json")
+    parser.add_argument("--chat-name", default=os.environ.get("TEAMS_CHAT_NAME", "Bảo vệ Ép (backup)"), help="Name of the Teams Group Chat")
+    parser.add_argument("--bot-name", default=os.environ.get("TEAMS_BOT_NAME", "Weather B"), help="Display name of your bot account when @mentioned")
     parser.add_argument("--listen", action="store_true", help="Continuously watch chat and reply immediately when someone tags @Weather Bot")
+    parser.add_argument("--headed", action="store_true", help="Show browser window while listening (for local debugging)")
     parser.add_argument("--max-minutes", type=int, default=0, help="Stop listener cleanly after N minutes (for GitHub Actions)")
     parser.add_argument("--check-mentions", action="store_true", help="Check once if the latest message tagged @Weather Bot and reply")
     parser.add_argument("--force", action="store_true", help="Send even if weather is clear at both locations")
@@ -508,16 +696,13 @@ def main():
         print(format_multi_location_message(results))
         return
 
-    if not args.chat_name:
-        print("ERROR: Please specify --chat-name 'Your Chat Name' or set TEAMS_CHAT_NAME", file=sys.stderr)
-        sys.exit(1)
-
     if args.listen or args.check_mentions:
         listen_for_mentions(
             args.chat_name,
             args.bot_name,
             one_shot=args.check_mentions,
             max_minutes=args.max_minutes,
+            headless=not args.headed,
         )
         return
 

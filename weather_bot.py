@@ -78,6 +78,8 @@ WMO_CODES = {
 
 def fetch_weather(lat: float, lon: float) -> dict:
     """Fetch current and hourly forecast from Open-Meteo (No API key needed)."""
+    import time
+
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}"
@@ -85,9 +87,15 @@ def fetch_weather(lat: float, lon: float) -> dict:
         f"&hourly=temperature_2m,precipitation_probability,precipitation,weather_code,wind_speed_10m"
         f"&timezone=auto&forecast_days=2"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "TeamsWeatherBot/1.0"})
-    with urllib.request.urlopen(req, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "TeamsWeatherBot/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
 
 
 def analyze_weather(data: dict, hours_ahead: int = HOURS_AHEAD_TO_CHECK) -> dict:
