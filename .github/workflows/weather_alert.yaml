@@ -1,1 +1,47 @@
-
+name: Teams Weather Bot 24-7 Listener (TTC & FPT Software)
+ 
+on:
+  # Restart listener every 6 hours so it runs 24/7 on GitHub's free Ubuntu cloud runners!
+  schedule:
+    - cron: '0 */6 * * *'
+  # Allow starting manually anytime from the GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode: "listen" (watch chat for ~6h) or "force" (send immediate update)'
+        required: false
+        default: 'listen'
+ 
+concurrency:
+  group: teams-weather-bot-listener
+  cancel-in-progress: true
+ 
+jobs:
+  run-weather-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+ 
+      - name: Install Playwright & Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+ 
+      - name: Run Weather Bot (Replies to @Weather Bot + Commute Rain Alerts)
+        env:
+          TEAMS_SESSION_B64: ${{ secrets.TEAMS_SESSION_B64 }}
+          TEAMS_CHAT_NAME: ${{ secrets.TEAMS_CHAT_NAME }}
+          TEAMS_BOT_NAME: ${{ vars.TEAMS_BOT_NAME || 'Weather Bot' }}
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "force" ]; then
+            python3 teams_web_sender.py --force
+          else
+            python3 teams_web_sender.py --listen --max-minutes 345
+          fi
