@@ -143,6 +143,41 @@ def _get_latest_chat_message(page) -> tuple[str, str]:
     return "", ""
 
 
+def export_compact_secret() -> str:
+    """Strip temporary React cache keys and gzip-compress teams_session.json so it easily fits in GitHub Secrets (<22 KB)."""
+    import gzip
+    import json
+
+    if not SESSION_FILE.exists():
+        print(f"ERROR: {SESSION_FILE} not found. Run --login first.", file=sys.stderr)
+        sys.exit(1)
+
+    data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+    slim_data = {
+        "cookies": data.get("cookies", []),
+        "origins": [
+            {
+                "origin": o["origin"],
+                "localStorage": [
+                    x
+                    for x in o.get("localStorage", [])
+                    if not x["name"].startswith("tmp.") and "|accesstoken|" not in x["name"]
+                ],
+            }
+            for o in data.get("origins", [])
+        ],
+    }
+    raw_bytes = json.dumps(slim_data, separators=(",", ":")).encode("utf-8")
+    compressed = gzip.compress(raw_bytes, compresslevel=9)
+    b64_str = base64.b64encode(compressed).decode("ascii")
+
+    out_path = SESSION_FILE.parent / "teams_session_b64.txt"
+    out_path.write_text(b64_str, encoding="utf-8")
+    print(f"✅ Generated compact secret ({len(b64_str)} chars, down from ~229,000 chars)!")
+    print(f"📄 Saved to: {out_path}")
+    return b64_str
+
+
 def save_login_session() -> None:
     """Open browser once so you can log in with your free @outlook.com Weather Bot account."""
     from playwright.sync_api import sync_playwright
@@ -161,16 +196,20 @@ def save_login_session() -> None:
         context.storage_state(path=str(SESSION_FILE))
         browser.close()
 
-    b64 = base64.b64encode(SESSION_FILE.read_bytes()).decode("ascii")
-    print(f"\n✅ Saved session to {SESSION_FILE}")
-    print("\nCopy the base64 string below into your Cloud Secret named TEAMS_SESSION_B64:")
-    print(b64[:80] + "... (run `base64 -w0 teams_session.json` to copy full string)")
+    print(f"\n✅ Saved raw session to {SESSION_FILE}")
+    export_compact_secret()
 
 
 def _ensure_session_file() -> None:
+    import gzip
+
     env_b64 = os.environ.get("TEAMS_SESSION_B64", "").strip()
     if env_b64:
-        SESSION_FILE.write_bytes(base64.b64decode(env_b64))
+        raw = base64.b64decode(env_b64)
+        # Automatically decompress if gzipped (starts with 0x1f 0x8b)
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        SESSION_FILE.write_bytes(raw)
     if not SESSION_FILE.exists():
         print("ERROR: Session file not found. Run `python3 teams_web_sender.py --login` once first.", file=sys.stderr)
         sys.exit(1)
@@ -274,6 +313,7 @@ def listen_for_mentions(
 def main():
     parser = argparse.ArgumentParser(description="Send TTC & FPT Software Weather Alert & Reply to @Mentions")
     parser.add_argument("--login", action="store_true", help="Log in once interactively to save session")
+    parser.add_argument("--export-secret", action="store_true", help="Export compact <22KB base64 secret from existing teams_session.json")
     parser.add_argument("--chat-name", default=os.environ.get("TEAMS_CHAT_NAME", ""), help="Name of the Teams Group Chat")
     parser.add_argument("--bot-name", default=os.environ.get("TEAMS_BOT_NAME", "Weather Bot"), help="Display name of your bot account when @mentioned")
     parser.add_argument("--listen", action="store_true", help="Continuously watch chat and reply immediately when someone tags @Weather Bot")
@@ -285,6 +325,10 @@ def main():
 
     if args.login:
         save_login_session()
+        return
+
+    if args.export_secret:
+        export_compact_secret()
         return
 
     if args.dry_run:
