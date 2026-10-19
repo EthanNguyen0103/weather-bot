@@ -120,55 +120,118 @@ def is_bot_mentioned(msg_text: str, bot_name: str) -> bool:
     return any(trig in lower for trig in BOT_TRIGGERS)
 
 
-def fetch_vitamin_sea_photo() -> tuple[bytes, str]:
-    """Fetch a random beach/summer portrait photo (bytes + source URL) without requiring an API key."""
+VOZ_THREAD_URL = "https://voz.vn/t/no-sex-vitamin-gai-xinh-moi-ngay-cho-doi-mat-sang-khoe-dep.783806"
+SEEN_PHOTOS_FILE = Path(__file__).parent / ".seen_vitamin_photos.txt"
+
+
+def _load_seen_photos() -> set[str]:
+    if SEEN_PHOTOS_FILE.exists():
+        return set(line.strip() for line in SEEN_PHOTOS_FILE.read_text(encoding="utf-8").splitlines() if line.strip())
+    return set()
+
+
+def _record_seen_photo(url: str, img_bytes: bytes, seen: set[str]) -> None:
+    img_hash = hashlib.sha256(img_bytes).hexdigest()[:24]
+    seen.add(url)
+    seen.add(img_hash)
+    with SEEN_PHOTOS_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"{url}\n{img_hash}\n")
+
+
+def fetch_vitamin_sea_photo(context=None) -> tuple[bytes, str]:
+    """Fetch a unique, unseen random photo from the VOZ Vitamin Gái Xinh thread (783806)."""
     import json
     import random
     import urllib.request
 
+    seen = _load_seen_photos()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Referer": "https://voz.vn/",
+    }
+
+    # 1. Primary source: VOZ Thread 783806 via Playwright browser tab (checks up to 4 random pages for an unseen photo)
+    if context is not None:
+        voz_page = None
+        try:
+            voz_page = context.new_page()
+            for _attempt in range(4):
+                random_page = random.randint(1, 350)
+                target_url = f"{VOZ_THREAD_URL}/page-{random_page}"
+                voz_page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+                voz_page.wait_for_timeout(2000)
+
+                img_urls = voz_page.evaluate(
+                    """() => {
+                        const imgs = Array.from(document.querySelectorAll('.message-body .bbWrapper img'));
+                        return [...new Set(imgs
+                            .map(img => img.getAttribute('data-url') || img.getAttribute('data-src') || img.src || '')
+                            .filter(u => u.startsWith('http')
+                                && !u.includes('/smilies/')
+                                && !u.includes('/avatars/')
+                                && !u.includes('twemoji')
+                                && !u.includes('reactions')
+                                && !u.endsWith('.gif')
+                                && !u.endsWith('.svg')))];
+                    }"""
+                )
+                # Filter out already-seen URLs
+                unseen_urls = [u for u in img_urls if u not in seen]
+                if unseen_urls:
+                    random.shuffle(unseen_urls)
+                    for candidate_url in unseen_urls[:8]:
+                        try:
+                            resp = voz_page.request.get(
+                                candidate_url, headers={"Referer": "https://voz.vn/"}, timeout=15000
+                            )
+                            if resp.ok:
+                                body = resp.body()
+                                img_hash = hashlib.sha256(body).hexdigest()[:24]
+                                # Check both size (>15 KB) AND content SHA-256 (skips quoted/re-uploaded duplicates!)
+                                if len(body) > 15000 and img_hash not in seen:
+                                    _record_seen_photo(candidate_url, body, seen)
+                                    voz_page.close()
+                                    return body, candidate_url
+                        except Exception:
+                            continue
+        except Exception as e:
+            print(f"Warning fetching from VOZ: {e}", file=sys.stderr)
+        finally:
+            if voz_page is not None and not voz_page.is_closed():
+                try:
+                    voz_page.close()
+                except Exception:
+                    pass
+
+    # 2. Fallback if Cloudflare blocks datacenter IP (also deduplicated by URL + SHA-256)
     queries = [
         "asian+woman+beach+summer+portrait",
         "korean+girl+beach+vacation+portrait",
-        "vietnam+beach+girl+summer+portrait",
-        "fashion+model+beach+sunset+portrait",
+        "vietnam+girl+summer+portrait",
     ]
     q = random.choice(queries)
-    page_num = random.randint(1, 5)
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0.0.0 Safari/537.36"}
-
-    img_url = ""
-    # 1. Try Unsplash public JSON search
+    page_num = random.randint(1, 10)
     try:
-        search_url = f"https://unsplash.com/napi/search/photos?query={q}&per_page=20&page={page_num}"
+        search_url = f"https://unsplash.com/napi/search/photos?query={q}&per_page=30&page={page_num}"
         req = urllib.request.Request(search_url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             results = data.get("results", [])
-            if results:
-                chosen = random.choice(results)
-                img_url = chosen.get("urls", {}).get("regular", "")
+            random.shuffle(results)
+            for item in results:
+                candidate_url = item.get("urls", {}).get("regular", "")
+                if candidate_url and candidate_url not in seen:
+                    img_req = urllib.request.Request(candidate_url, headers=headers)
+                    with urllib.request.urlopen(img_req, timeout=15) as img_resp:
+                        body = img_resp.read()
+                        img_hash = hashlib.sha256(body).hexdigest()[:24]
+                        if img_hash not in seen:
+                            _record_seen_photo(candidate_url, body, seen)
+                            return body, candidate_url
     except Exception:
         pass
 
-    # 2. Fallback to Wallhaven SFW People/Beach search
-    if not img_url:
-        try:
-            wh_url = "https://wallhaven.cc/api/v1/search?q=beach+girl&categories=001&purity=100&sorting=random"
-            req = urllib.request.Request(wh_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                results = data.get("data", [])
-                if results:
-                    img_url = random.choice(results).get("path", "")
-        except Exception:
-            pass
-
-    if not img_url:
-        raise RuntimeError("Could not fetch a Vitamin Sea photo URL.")
-
-    img_req = urllib.request.Request(img_url, headers=headers)
-    with urllib.request.urlopen(img_req, timeout=15) as resp:
-        return resp.read(), img_url
+    raise RuntimeError("Could not fetch a new unseen Vitamin photo.")
 
 
 def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
@@ -228,7 +291,7 @@ def _get_latest_chat_message(page) -> tuple[str, str]:
         if count > 0:
             last_text = loc.nth(count - 1).inner_text(timeout=5000).strip()
             if last_text:
-                msg_hash = hashlib.sha256(last_text.encode("utf-8")).hexdigest()[:16]
+                msg_hash = hashlib.sha256(f"{count}:{last_text}".encode("utf-8")).hexdigest()[:16]
                 return msg_hash, last_text
     return "", ""
 
@@ -329,7 +392,7 @@ def listen_for_mentions(
     chat_name: str,
     bot_name: str,
     one_shot: bool = False,
-    poll_interval: int = 8,
+    poll_interval: int = 3,
     start_server: bool = True,
     max_minutes: int = 0,
 ) -> None:
@@ -342,6 +405,8 @@ def listen_for_mentions(
 
     last_replied = LAST_REPLIED_FILE.read_text().strip() if LAST_REPLIED_FILE.exists() else ""
     last_auto_alert_ts = 0.0
+    last_vitamin_ts = 0.0
+    vitamin_cooldown_sec = int(os.environ.get("VITAMIN_COOLDOWN_SEC", "60"))
     start_ts = time.time()
 
     with sync_playwright() as p:
@@ -353,7 +418,7 @@ def listen_for_mentions(
         page.wait_for_timeout(3000)
 
         print(
-            f"👂 Listening for @mentions ('{bot_name}', !weather) + rain alerts in '{chat_name}'..."
+            f"👂 Listening for @mentions ('{bot_name}', !weather, !vitaminSea) in '{chat_name}'..."
             if not one_shot
             else f"🔍 Checking for new @mentions in chat '{chat_name}'..."
         )
@@ -364,13 +429,21 @@ def listen_for_mentions(
                 msg_hash, msg_text = _get_latest_chat_message(page)
                 if msg_hash and msg_hash != last_replied:
                     if is_vitamin_sea_command(msg_text):
-                        print(f"[{datetime.now(VN_TZ).isoformat()}] 🌊 Detected !vitaminSea command: {msg_text!r}")
-                        img_bytes, img_url = fetch_vitamin_sea_photo()
-                        caption = "🌊 Vitamin Sea tiếp thêm năng lượng code cho anh em! 🏖️✨"
-                        _send_image_in_page(page, img_bytes, caption)
-                        last_replied = msg_hash
-                        LAST_REPLIED_FILE.write_text(last_replied)
-                        print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent Vitamin Sea photo ({img_url})!")
+                        elapsed = time.time() - last_vitamin_ts
+                        if elapsed < vitamin_cooldown_sec:
+                            wait_left = int(vitamin_cooldown_sec - elapsed)
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ⏳ Anti-spam cooldown active ({wait_left}s left), ignoring !girl.")
+                            last_replied = msg_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                        else:
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] 🌊 Detected !vitaminSea command: {msg_text!r}")
+                            img_bytes, img_url = fetch_vitamin_sea_photo(context)
+                            caption = "🌊 Vitamin Gái Xinh VOZ tiếp thêm năng lượng code cho anh em! ✨"
+                            _send_image_in_page(page, img_bytes, caption)
+                            last_vitamin_ts = time.time()
+                            last_replied = msg_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent VOZ photo ({img_url})!")
                     elif is_bot_mentioned(msg_text, bot_name):
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🔔 Detected bot tag: {msg_text!r}")
                         locs = filter_locations_from_query(msg_text)
