@@ -1,6 +1,9 @@
 name: Teams Weather Bot 24-7 Listener (TTC & FPT Software)
 
 on:
+  # Automatically restart the listener with new code whenever you push to main!
+  push:
+    branches: [ main ]
   # Restart listener every 6 hours so it runs 24/7 on GitHub's free Ubuntu cloud runners!
   schedule:
     - cron: '0 */6 * * *'
@@ -34,6 +37,14 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
+      - name: Restore seen photos history (prevent duplicates across runs)
+        uses: actions/cache/restore@v4
+        with:
+          path: .seen_vitamin_photos.txt
+          key: seen-photos-${{ github.run_id }}
+          restore-keys: |
+            seen-photos-
+
       - name: Run Weather Bot (Replies to @Weather Bot + Commute Rain Alerts)
         env:
           TEAMS_SESSION_B64: ${{ secrets.TEAMS_SESSION_B64 }}
@@ -45,3 +56,10 @@ jobs:
           else
             python3 teams_web_sender.py --listen --max-minutes 345
           fi
+
+      - name: Save seen photos history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .seen_vitamin_photos.txt
+          key: seen-photos-${{ github.run_id }}
