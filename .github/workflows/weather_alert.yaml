@@ -47,6 +47,7 @@ jobs:
 
       - name: Run Weather Bot (Replies to @Weather Bot + Commute Rain Alerts)
         env:
+          PYTHONUNBUFFERED: "1"
           TEAMS_SESSION_B64: ${{ secrets.TEAMS_SESSION_B64 }}
           TEAMS_CHAT_NAME: ${{ secrets.TEAMS_CHAT_NAME }}
           TEAMS_BOT_NAME: ${{ vars.TEAMS_BOT_NAME || 'Weather Bot' }}
