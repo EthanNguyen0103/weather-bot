@@ -4,9 +4,9 @@ on:
   # Automatically restart the listener with new code whenever you push to main!
   push:
     branches: [ main ]
-  # Restart listener every 6 hours so it runs 24/7 on GitHub's free Ubuntu cloud runners!
+  # Backup cron every 2 hours to auto-recover if a runner ever crashes
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */2 * * *'
   # Allow starting manually anytime from the GitHub Actions tab
   workflow_dispatch:
     inputs:
@@ -15,9 +15,13 @@ on:
         required: false
         default: 'listen'
 
+permissions:
+  actions: write
+  contents: read
+
 concurrency:
   group: teams-weather-bot-listener
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   run-weather-bot:
@@ -64,3 +68,12 @@ jobs:
         with:
           path: .seen_vitamin_photos.txt
           key: seen-photos-${{ github.run_id }}
+
+      - name: Auto-restart next 6h listener session (24/7 continuous loop)
+        if: always() && !cancelled() && github.event.inputs.mode != 'force'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔄 Triggering next 6-hour listener run automatically..."
+          gh workflow run weather_alert.yml --ref ${{ github.ref_name }}
+ 
