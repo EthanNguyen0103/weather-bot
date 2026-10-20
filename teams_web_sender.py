@@ -27,7 +27,7 @@ LAST_REPLIED_FILE = Path(__file__).parent / ".last_replied_msg"
 VN_TZ = timezone(timedelta(hours=7))
 
 # Trigger keywords/names when someone tags or asks the bot in chat
-BOT_TRIGGERS = ["@weather", "weather b", "weather bot", "!weather", "/weather", "thời tiết", "thoi tiet"]
+BOT_TRIGGERS = ["@weather", "weather b", "weather bot", "!weather"]
 
 
 def start_health_server() -> None:
