@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+​#!/usr/bin/env python3
 """
 Send Weather Alerts & Reply to @Mentions for TTC (Tan Thuan Tower) & FPT Software TP.HCM
 in MS Teams External Chat using a Free Personal @outlook.com Account.
@@ -103,11 +103,25 @@ def filter_locations_from_query(text: str) -> list:
 
 
 def is_vitamin_sea_command(msg_text: str) -> bool:
-    """Check if a chat message requests !vitaminSea."""
+    """Check if a chat message requests !vitaminSea or !girl."""
     lower = msg_text.lower().strip()
     if "🌊 vitamin" in lower or "tiếp thêm năng lượng code" in lower:
         return False
     return any(cmd in lower for cmd in ["!vitaminsea", "/vitaminsea", "!vitamin", "!girl"])
+
+
+def is_nsfw_command(msg_text: str) -> bool:
+    """Check if a chat message requests !nsfw or !cosplay."""
+    lower = msg_text.lower().strip()
+    if "🔥 vitamin cosplay" in lower or "tiếp thêm năng lượng" in lower:
+        return False
+    return any(cmd in lower for cmd in ["!nsfw", "/nsfw", "!cosplay"])
+
+
+def is_remove_command(msg_text: str) -> bool:
+    """Check if a chat message requests !remove / !delete to delete the bot's latest message."""
+    lower = msg_text.lower().strip()
+    return any(cmd in lower for cmd in ["!remove", "/remove", "!delete", "!undo", "!xoa"])
 
 
 def is_bot_mentioned(msg_text: str, bot_name: str) -> bool:
@@ -121,6 +135,7 @@ def is_bot_mentioned(msg_text: str, bot_name: str) -> bool:
 
 
 VOZ_THREAD_URL = "https://voz.vn/t/no-sex-vitamin-gai-xinh-moi-ngay-cho-doi-mat-sang-khoe-dep.783806"
+COSPLAY_CATEGORY_URL = "https://cosplaytele.com/category/cosplay"
 SEEN_PHOTOS_FILE = Path(__file__).parent / ".seen_vitamin_photos.txt"
 
 
@@ -163,28 +178,50 @@ def fetch_vitamin_sea_photo(context=None) -> tuple[bytes, str]:
 
                 img_urls = voz_page.evaluate(
                     """() => {
+                        const isTrashElement = (el) => {
+                            const cls = (el.className || '').toString().toLowerCase();
+                            if (cls.includes('avatar') || cls.includes('smilie') || cls.includes('emoji') || cls.includes('icon')) {
+                                return true;
+                            }
+                            if (el.closest('.avatar, [class*="avatar"], .message-avatar, .bbCodeBlock--unfurl, .contentRow-figure, .reactionsBar, .message-signature')) {
+                                return true;
+                            }
+                            const w = parseInt(el.getAttribute('width') || '0', 10) || el.naturalWidth || 0;
+                            const h = parseInt(el.getAttribute('height') || '0', 10) || el.naturalHeight || 0;
+                            if ((w > 0 && w < 220) || (h > 0 && h < 220)) {
+                                return true;
+                            }
+                            return false;
+                        };
                         const raw = [];
                         document.querySelectorAll('.message-body .bbWrapper img').forEach(img => {
+                            if (isTrashElement(img)) return;
                             const u = img.getAttribute('data-url') || img.getAttribute('data-src') || img.getAttribute('src') || img.src || '';
                             if (u) raw.push(u);
                         });
                         document.querySelectorAll('.message-body .bbWrapper a.js-lbImage').forEach(a => {
+                            if (isTrashElement(a)) return;
                             const u = a.getAttribute('href') || '';
                             if (u) raw.push(u);
                         });
                         const resolved = raw.map(u => {
                             try { return new URL(u, document.baseURI).href; } catch (e) { return ''; }
                         });
-                        return [...new Set(resolved.filter(u =>
-                            u.startsWith('http')
-                            && !u.includes('/smilies/')
-                            && !u.includes('/avatars/')
-                            && !u.includes('twemoji')
-                            && !u.includes('reactions')
-                            && !u.includes('data:image')
-                            && !u.endsWith('.gif')
-                            && !u.endsWith('.svg')
-                        ))];
+                        return [...new Set(resolved.filter(u => {
+                            const low = u.toLowerCase();
+                            return low.startsWith('http')
+                                && !low.includes('/smilies/')
+                                && !low.includes('/avatars/')
+                                && !low.includes('avatar')
+                                && !low.includes('favicon')
+                                && !low.includes('logo')
+                                && !low.includes('twemoji')
+                                && !low.includes('reactions')
+                                && !low.includes('data:image')
+                                && !low.endsWith('.gif')
+                                && !low.endsWith('.svg')
+                                && !low.endsWith('.ico');
+                        }))];
                     }"""
                 )
                 unseen_urls = [u for u in img_urls if u not in seen]
@@ -198,7 +235,7 @@ def fetch_vitamin_sea_photo(context=None) -> tuple[bytes, str]:
                             if resp.ok:
                                 body = resp.body()
                                 img_hash = hashlib.sha256(body).hexdigest()[:24]
-                                if len(body) > 15000 and img_hash not in seen:
+                                if len(body) > 35000 and img_hash not in seen:
                                     _record_seen_photo(candidate_url, body, seen)
                                     voz_page.close()
                                     return body, candidate_url
@@ -276,6 +313,175 @@ def fetch_vitamin_sea_photo(context=None) -> tuple[bytes, str]:
     raise RuntimeError("Could not fetch a new unseen Vitamin photo.")
 
 
+def fetch_cosplay_photo(context=None) -> tuple[bytes, str]:
+    """Fetch a unique, unseen random photo from cosplaytele.com/category/cosplay/ with multi-source fallbacks."""
+    import json
+    import random
+    import urllib.request
+
+    seen = _load_seen_photos()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://cosplaytele.com/",
+    }
+
+    # 1. Primary source: cosplaytele.com/category/cosplay/ via Playwright browser tab
+    if context is not None:
+        cp_page = None
+        try:
+            cp_page = context.new_page()
+            for _attempt in range(3):
+                random_page = random.randint(1, 45)
+                cat_url = (
+                    f"{COSPLAY_CATEGORY_URL}/page/{random_page}/"
+                    if random_page > 1
+                    else f"{COSPLAY_CATEGORY_URL}/"
+                )
+                cp_page.goto(cat_url, wait_until="domcontentloaded", timeout=20000)
+                cp_page.wait_for_timeout(1500)
+
+                # Collect album post links on the category page so we can grab full-res gallery images inside a random post
+                post_links = cp_page.evaluate(
+                    """() => {
+                        const links = Array.from(document.querySelectorAll('a[href^="https://cosplaytele.com/"]'))
+                            .map(a => a.href)
+                            .filter(h =>
+                                !h.includes('/category/')
+                                && !h.includes('/tag/')
+                                && !h.includes('/page/')
+                                && !h.includes('/wp-')
+                                && !h.includes('#')
+                                && h.length > 28
+                            );
+                        return [...new Set(links)];
+                    }"""
+                )
+                if post_links:
+                    random.shuffle(post_links)
+                    cp_page.goto(post_links[0], wait_until="domcontentloaded", timeout=20000)
+                    cp_page.wait_for_timeout(1200)
+
+                img_urls = cp_page.evaluate(
+                    """() => {
+                        const raw = [];
+                        document.querySelectorAll('.entry-content img, .gallery-icon img, figure img, .box-image img').forEach(img => {
+                            const cls = (img.className || '').toString().toLowerCase();
+                            if (cls.includes('avatar') || cls.includes('emoji') || cls.includes('logo') || cls.includes('icon')) return;
+                            if (img.closest('.avatar, [class*="avatar"], .author-box, .comments-area, header, footer')) return;
+                            const w = parseInt(img.getAttribute('width') || '0', 10) || img.naturalWidth || 0;
+                            const h = parseInt(img.getAttribute('height') || '0', 10) || img.naturalHeight || 0;
+                            if ((w > 0 && w < 220) || (h > 0 && h < 220)) return;
+                            const u = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('src') || img.src || '';
+                            if (u) {
+                                // Strip WordPress thumbnail size suffix like -300x400.jpg -> .jpg for full resolution
+                                raw.push(u.replace(/-\\d+x\\d+(?=\\.(jpg|jpeg|png|webp))/i, ''));
+                                raw.push(u);
+                            }
+                        });
+                        return [...new Set(raw.filter(u => {
+                            const low = u.toLowerCase();
+                            return low.startsWith('http')
+                                && !low.includes('avatar')
+                                && !low.includes('gravatar')
+                                && !low.includes('logo')
+                                && !low.includes('favicon')
+                                && !low.includes('data:image')
+                                && !low.endsWith('.gif')
+                                && !low.endsWith('.svg');
+                        }))];
+                    }"""
+                )
+                unseen_urls = [u for u in img_urls if u not in seen]
+                if unseen_urls:
+                    random.shuffle(unseen_urls)
+                    for candidate_url in unseen_urls[:8]:
+                        try:
+                            resp = cp_page.request.get(
+                                candidate_url, headers={"Referer": "https://cosplaytele.com/"}, timeout=12000
+                            )
+                            if resp.ok:
+                                body = resp.body()
+                                img_hash = hashlib.sha256(body).hexdigest()[:24]
+                                if len(body) > 35000 and img_hash not in seen:
+                                    _record_seen_photo(candidate_url, body, seen)
+                                    cp_page.close()
+                                    return body, candidate_url
+                        except Exception:
+                            continue
+        except Exception as e:
+            print(f"Warning fetching from CosplayTele: {e}", file=sys.stderr)
+        finally:
+            if cp_page is not None and not cp_page.is_closed():
+                try:
+                    cp_page.close()
+                except Exception:
+                    pass
+
+    # 2. Secondary source: CosplayTele WordPress REST API (/wp-json/wp/v2/posts)
+    try:
+        wp_page = random.randint(1, 30)
+        wp_url = f"https://cosplaytele.com/wp-json/wp/v2/posts?per_page=10&page={wp_page}"
+        req = urllib.request.Request(wp_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            posts = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            random.shuffle(posts)
+            for post in posts[:3]:
+                rendered = post.get("content", {}).get("rendered", "")
+                found = re.findall(r'https://[^\s"\'<>]+?\.(?:jpg|jpeg|png)', rendered, flags=re.IGNORECASE)
+                unseen_wp = [u for u in found if u not in seen and "logo" not in u.lower()]
+                random.shuffle(unseen_wp)
+                for candidate_url in unseen_wp[:8]:
+                    try:
+                        img_req = urllib.request.Request(candidate_url, headers=headers)
+                        with urllib.request.urlopen(img_req, timeout=10) as img_resp:
+                            body = img_resp.read()
+                            img_hash = hashlib.sha256(body).hexdigest()[:24]
+                            if len(body) > 15000 and img_hash not in seen:
+                                _record_seen_photo(candidate_url, body, seen)
+                                return body, candidate_url
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # 3. Tertiary source: Bing Images async search for cosplaytele.com & Asian Cosplay
+    bing_queries = [
+        "site:cosplaytele.com+cosplay",
+        "cosplaytele+anime+cosplay+girl",
+        "asian+cosplay+girl+photoshoot",
+    ]
+    random.shuffle(bing_queries)
+    for q in bing_queries[:2]:
+        try:
+            offset = random.randint(1, 60)
+            bing_url = f"https://www.bing.com/images/async?q={q}&first={offset}&count=35&adlt=off"
+            req = urllib.request.Request(bing_url, headers={"User-Agent": headers["User-Agent"]})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            candidates = re.findall(r"murl&quot;:&quot;(https://[^&]+?)&quot;", html, flags=re.IGNORECASE)
+            unseen_candidates = [
+                u for u in candidates
+                if u not in seen and not u.lower().endswith((".gif", ".svg", ".webp"))
+            ]
+            random.shuffle(unseen_candidates)
+            for candidate_url in unseen_candidates[:10]:
+                try:
+                    img_req = urllib.request.Request(candidate_url, headers={"User-Agent": headers["User-Agent"]})
+                    with urllib.request.urlopen(img_req, timeout=10) as img_resp:
+                        ctype = img_resp.headers.get("Content-Type", "")
+                        body = img_resp.read()
+                        img_hash = hashlib.sha256(body).hexdigest()[:24]
+                        if "image" in ctype and len(body) > 15000 and img_hash not in seen:
+                            _record_seen_photo(candidate_url, body, seen)
+                            return body, candidate_url
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    raise RuntimeError("Could not fetch a new unseen Cosplay photo.")
+
+
 def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
     """Paste an image directly into the Teams chat compose box and click the Send button."""
     compose = page.locator('[role="textbox"][contenteditable="true"]').first
@@ -337,6 +543,57 @@ def _send_text_in_page(page, message: str) -> None:
             page.keyboard.insert_text(line)
     page.keyboard.press("Enter")
     page.wait_for_timeout(2500)
+
+
+def _delete_latest_bot_message(page) -> bool:
+    """Find the bot's most recent sent message in the Teams chat pane, open More message options, and click Delete."""
+    # Scroll chat pane to the bottom first so the latest messages are mounted in the DOM
+    try:
+        page.evaluate(
+            """() => {
+                const msgs = document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body');
+                if (msgs.length > 0) {
+                    const last = msgs[msgs.length - 1];
+                    last.scrollIntoView({ block: 'end' });
+                    let p = last.parentElement;
+                    while (p) {
+                        if (p.scrollHeight > p.clientHeight) p.scrollTop = p.scrollHeight;
+                        p = p.parentElement;
+                    }
+                }
+            }"""
+        )
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    # Walk backwards through the last 8 "More message options" buttons from newest to oldest.
+    # Only the bot's own messages will have a "Delete" item in their action menu!
+    more_btns = page.locator('button[data-tid="message-actions-menu-hidden-button"], button[title*="More message options"]')
+    total = more_btns.count()
+    for idx in range(total - 1, max(-1, total - 9), -1):
+        try:
+            btn = more_btns.nth(idx)
+            btn.scroll_into_view_if_needed(timeout=3000)
+            btn.hover(force=True, timeout=3000)
+            btn.click(force=True, timeout=3000)
+            page.wait_for_timeout(600)
+
+            del_item = page.locator('[role="menuitem"]:has-text("Delete"), [data-tid*="delete"]')
+            if del_item.count() > 0 and del_item.first.is_visible():
+                del_item.first.click(timeout=3000)
+                page.wait_for_timeout(1500)
+                return True
+            else:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            continue
+    return False
 
 
 def _get_latest_chat_message(page, chat_name: str = "") -> tuple[str, str]:
@@ -591,7 +848,7 @@ def listen_for_mentions(
         _open_target_chat(page, chat_name)
 
         print(
-            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !vitaminSea, !leetcode)..."
+            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !nsfw, !remove, !leetcode)..."
             if not one_shot
             else f"🔍 Checking for new @mentions..."
         )
@@ -600,10 +857,19 @@ def listen_for_mentions(
 
         while True:
             try:
-                # 1. Check if someone typed !vitaminSea / !girl, !leetcode, or tagged @Weather Bot in the chat
+                # 1. Check if someone typed !remove, !girl, !nsfw, !leetcode, or tagged @Weather Bot in the chat
                 msg_hash, msg_text = _get_latest_chat_message(page, chat_name)
                 if msg_hash and msg_hash != last_replied:
-                    if is_vitamin_sea_command(msg_text):
+                    if is_remove_command(msg_text):
+                        print(f"[{datetime.now(VN_TZ).isoformat()}] 🗑️ Detected !remove command: {msg_text!r}")
+                        last_replied = msg_hash
+                        LAST_REPLIED_FILE.write_text(last_replied)
+                        deleted = _delete_latest_bot_message(page)
+                        if deleted:
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Deleted latest bot message!")
+                        else:
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ⚠️ Could not find a recent bot message to delete.")
+                    elif is_vitamin_sea_command(msg_text):
                         elapsed = time.time() - last_vitamin_ts
                         if elapsed < vitamin_cooldown_sec:
                             wait_left = int(vitamin_cooldown_sec - elapsed)
@@ -624,6 +890,26 @@ def listen_for_mentions(
                                 last_replied = new_hash
                                 LAST_REPLIED_FILE.write_text(last_replied)
                             print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent VOZ photo ({img_url})!")
+                    elif is_nsfw_command(msg_text):
+                        elapsed = time.time() - last_vitamin_ts
+                        if elapsed < vitamin_cooldown_sec:
+                            wait_left = int(vitamin_cooldown_sec - elapsed)
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ⏳ Anti-spam cooldown active ({wait_left}s left), ignoring !nsfw.")
+                            last_replied = msg_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                        else:
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] 🔥 Detected !nsfw / !cosplay command: {msg_text!r}")
+                            last_replied = msg_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                            img_bytes, img_url = fetch_cosplay_photo(context)
+                            caption = "🔥 Vitamin Cosplay tiếp thêm năng lượng code cho anh em! ✨"
+                            _send_image_in_page(page, img_bytes, caption)
+                            last_vitamin_ts = time.time()
+                            new_hash, _ = _get_latest_chat_message(page, chat_name)
+                            if new_hash:
+                                last_replied = new_hash
+                                LAST_REPLIED_FILE.write_text(last_replied)
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent Cosplay photo ({img_url})!")
                     elif is_leetcode_command(msg_text):
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🧩 Detected !leetcode command: {msg_text!r}")
                         last_replied = msg_hash
