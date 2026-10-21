@@ -578,40 +578,61 @@ def _send_text_in_page(page, message: str) -> None:
     page.wait_for_timeout(2000)
 
 
-def _delete_latest_bot_message(page) -> bool:
-    """Find the bot's most recent sent message (.fui-ChatMyMessage), right-click its body, and click message-actions-delete."""
-    # 1. Scroll virtualized chat pane to the very bottom using center mouse wheel so the latest messages are mounted
+def _delete_latest_bot_message(page, timeout_sec: float = 4.0) -> bool:
+    """Find the bot's most recent sent message (.fui-ChatMyMessage__body), right-click it, and click Delete within timeout_sec."""
+    deadline = time.time() + timeout_sec
+
+    # Quick scroll at center of chat pane to make sure bottom messages are mounted
     try:
         page.mouse.move(650, 400)
-        for _ in range(6):
-            page.mouse.wheel(0, 8000)
-            page.wait_for_timeout(200)
+        page.mouse.wheel(0, 10000)
+        page.wait_for_timeout(120)
     except Exception:
         pass
 
-    # 2. Walk backwards through the bot's own messages (.fui-ChatMyMessage) from newest to oldest
-    my_msgs = page.locator(".fui-ChatMyMessage")
-    total = my_msgs.count()
-    for idx in range(total - 1, -1, -1):
+    bodies = page.locator(".fui-ChatMyMessage__body")
+    try:
+        total = bodies.count()
+    except Exception:
+        return False
+
+    # Only inspect the last 4 bot message bodies so we never lag scanning old history
+    start_idx = max(0, total - 4)
+    for idx in range(total - 1, start_idx - 1, -1):
+        if time.time() >= deadline:
+            break
         try:
-            msg_el = my_msgs.nth(idx)
-            txt = msg_el.inner_text(timeout=2000).lower()
-            if "message has been deleted" in txt or "tin nhắn đã bị xóa" in txt:
+            body_el = bodies.nth(idx)
+            is_valid = body_el.evaluate(
+                """(el) => {
+                    const msg = el.closest('.fui-ChatMyMessage') || el;
+                    const txt = (msg.innerText || '').toLowerCase();
+                    if (txt.includes('message has been deleted') || txt.includes('tin nhắn đã bị xóa')) {
+                        return false;
+                    }
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    return true;
+                }""",
+                timeout=700,
+            )
+            if not is_valid:
                 continue
 
-            body_el = msg_el.locator(".fui-ChatMyMessage__body").first
-            body_el.scroll_into_view_if_needed(timeout=3000)
-            body_el.click(button="right", timeout=3000)
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(100)
+            # Right-click near top-left of bubble (x=14, y=10) to avoid hitting center <img> overlays on !girl / !nsfw photos
+            body_el.click(button="right", position={"x": 14, "y": 10}, timeout=800, force=True)
 
-            del_item = page.locator('[data-tid="message-actions-delete"], [role="menuitem"]:has-text("Delete")')
-            if del_item.count() > 0 and del_item.first.is_visible():
-                del_item.first.click(timeout=3000)
-                page.wait_for_timeout(1500)
+            del_item = page.locator(
+                '[data-tid="message-actions-delete"], [role="menuitem"]:has-text("Delete"), [role="menuitem"]:has-text("Xóa")'
+            ).first
+            try:
+                del_item.wait_for(state="visible", timeout=650)
+                del_item.click(timeout=800)
+                page.wait_for_timeout(600)
                 return True
-            else:
+            except Exception:
                 page.keyboard.press("Escape")
-                page.wait_for_timeout(200)
+                page.wait_for_timeout(80)
         except Exception:
             try:
                 page.keyboard.press("Escape")
@@ -631,9 +652,9 @@ def _get_latest_chat_message(page, chat_name: str = "") -> tuple[str, str]:
             page.wait_for_timeout(300)
 
         page.mouse.move(650, 400)
-        for _ in range(4):
+        for _ in range(2):
             page.mouse.wheel(0, 8000)
-            page.wait_for_timeout(120)
+            page.wait_for_timeout(60)
     except Exception:
         pass
 
@@ -848,7 +869,9 @@ def listen_for_mentions(
     # Initialize to current time so starting --listen doesn't immediately trigger a redundant commute check
     last_auto_alert_ts = time.time()
     last_vitamin_ts = 0.0
+    last_remove_ts = 0.0
     vitamin_cooldown_sec = int(os.environ.get("VITAMIN_COOLDOWN_SEC", "15"))
+    remove_cooldown_sec = float(os.environ.get("REMOVE_COOLDOWN_SEC", "4"))
     start_ts = time.time()
 
     with sync_playwright() as p:
@@ -881,14 +904,22 @@ def listen_for_mentions(
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
                     elif is_remove_command(msg_text):
-                        print(f"[{datetime.now(VN_TZ).isoformat()}] 🗑️ Detected !remove command: {msg_text!r}")
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
-                        deleted = _delete_latest_bot_message(page)
-                        if deleted:
-                            print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Deleted latest bot message!")
+                        if (time.time() - last_remove_ts) < remove_cooldown_sec:
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ⏳ !remove cooldown active, skipping to avoid lag.")
                         else:
-                            print(f"[{datetime.now(VN_TZ).isoformat()}] ⚠️ Could not find a recent bot message to delete.")
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] 🗑️ Detected !remove command: {msg_text!r}")
+                            last_remove_ts = time.time()
+                            deleted = _delete_latest_bot_message(page, timeout_sec=3.5)
+                            new_hash, _ = _get_latest_chat_message(page, chat_name)
+                            if new_hash:
+                                last_replied = new_hash
+                                LAST_REPLIED_FILE.write_text(last_replied)
+                            if deleted:
+                                print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Deleted latest bot message!")
+                            else:
+                                print(f"[{datetime.now(VN_TZ).isoformat()}] ⚠️ Could not find a recent bot message to delete (or timed out).")
                     elif is_vitamin_sea_command(msg_text):
                         elapsed = time.time() - last_vitamin_ts
                         if elapsed < vitamin_cooldown_sec:
