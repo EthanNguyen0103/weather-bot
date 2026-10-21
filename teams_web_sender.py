@@ -489,13 +489,32 @@ def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
         pass
 
     b64_img = base64.b64encode(img_bytes).decode("ascii")
-    # Dispatch a synthetic paste event with image/jpeg File in DataTransfer
+    # Normalize any PNG/WebP/large 4K image into a clean <=1280px JPEG (~150KB) via Canvas and paste into Teams compose box
     compose.evaluate(
-        """(el, b64) => {
+        """async (el, b64) => {
             const bin = atob(b64);
             const arr = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-            const file = new File([arr], "vitamin_sea.jpg", { type: "image/jpeg" });
+            let blob = new Blob([arr]);
+            try {
+                const bmp = await createImageBitmap(blob);
+                const maxDim = 1280;
+                let w = bmp.width, h = bmp.height;
+                if (w > maxDim || h > maxDim) {
+                    if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+                    else { w = Math.round(w * maxDim / h); h = maxDim; }
+                }
+                const canvas = document.createElement("canvas");
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(bmp, 0, 0, w, h);
+                const jpegBlob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.88));
+                if (jpegBlob) blob = jpegBlob;
+            } catch (e) {
+                blob = new Blob([arr], { type: "image/jpeg" });
+            }
+            const file = new File([blob], "vitamin_sea.jpg", { type: "image/jpeg" });
             const dt = new DataTransfer();
             dt.items.add(file);
             const evt = new ClipboardEvent("paste", {
@@ -511,7 +530,7 @@ def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
     page.wait_for_timeout(3500)
     compose.click(timeout=10000)
     page.keyboard.insert_text(caption)
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(600)
 
     # When an inline image is present, Teams Web requires clicking newMessageCommands-send (or Ctrl+Enter) instead of plain Enter
     send_btn = page.locator('[data-tid="newMessageCommands-send"]')
@@ -520,57 +539,72 @@ def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
     else:
         page.keyboard.press("Control+Enter")
         page.keyboard.press("Enter")
-    page.wait_for_timeout(3000)
+    # Wait for PUT https://experimental-api.asm.skype.com/v1/objects/.../content + final POST /messages to finish
+    page.wait_for_timeout(5500)
 
 
 def _send_text_in_page(page, message: str) -> None:
-    """Type a multi-line message into the active Teams compose box and press Enter."""
+    """Type a multi-line message into the active Teams compose box and click Send (or press Enter)."""
     compose = page.locator('[role="textbox"][contenteditable="true"]').first
     compose.click(timeout=20000)
+
+    # Discard any stuck leftover draft in the compose box first
+    try:
+        discard = page.locator('[data-tid="newMessageCommands-discard-draft"]')
+        if discard.count() > 0 and discard.first.is_visible():
+            discard.first.click(timeout=3000)
+            page.wait_for_timeout(800)
+            compose.click(timeout=10000)
+    except Exception:
+        pass
+
     for i, line in enumerate(message.split("\n")):
         if i > 0:
             page.keyboard.press("Shift+Enter")
         if line:
             page.keyboard.insert_text(line)
+    page.wait_for_timeout(400)
     page.keyboard.press("Enter")
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(600)
+
+    # If the compose box was in expanded mode where Enter only adds a newline, click the Send button explicitly
+    try:
+        if compose.inner_text(timeout=2000).strip():
+            send_btn = page.locator('[data-tid="newMessageCommands-send"]')
+            if send_btn.count() > 0 and send_btn.first.is_visible():
+                send_btn.first.click(timeout=5000)
+    except Exception:
+        pass
+    page.wait_for_timeout(2000)
 
 
 def _delete_latest_bot_message(page) -> bool:
-    """Find the bot's most recent sent message in the Teams chat pane, open More message options, and click Delete."""
-    # Scroll chat pane to the bottom first so the latest messages are mounted in the DOM
+    """Find the bot's most recent sent message (.fui-ChatMyMessage), right-click its body, and click message-actions-delete."""
+    # 1. Scroll virtualized chat pane to the very bottom using center mouse wheel so the latest messages are mounted
     try:
-        page.evaluate(
-            """() => {
-                const msgs = document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body');
-                if (msgs.length > 0) {
-                    const last = msgs[msgs.length - 1];
-                    last.scrollIntoView({ block: 'end' });
-                    let p = last.parentElement;
-                    while (p) {
-                        if (p.scrollHeight > p.clientHeight) p.scrollTop = p.scrollHeight;
-                        p = p.parentElement;
-                    }
-                }
-            }"""
-        )
-        page.wait_for_timeout(800)
+        page.mouse.move(650, 400)
+        for _ in range(6):
+            page.mouse.wheel(0, 8000)
+            page.wait_for_timeout(200)
     except Exception:
         pass
 
-    # Walk backwards through the last 8 "More message options" buttons from newest to oldest.
-    # Only the bot's own messages will have a "Delete" item in their action menu!
-    more_btns = page.locator('button[data-tid="message-actions-menu-hidden-button"], button[title*="More message options"]')
-    total = more_btns.count()
-    for idx in range(total - 1, max(-1, total - 9), -1):
+    # 2. Walk backwards through the bot's own messages (.fui-ChatMyMessage) from newest to oldest
+    my_msgs = page.locator(".fui-ChatMyMessage")
+    total = my_msgs.count()
+    for idx in range(total - 1, -1, -1):
         try:
-            btn = more_btns.nth(idx)
-            btn.scroll_into_view_if_needed(timeout=3000)
-            btn.hover(force=True, timeout=3000)
-            btn.click(force=True, timeout=3000)
-            page.wait_for_timeout(600)
+            msg_el = my_msgs.nth(idx)
+            txt = msg_el.inner_text(timeout=2000).lower()
+            if "message has been deleted" in txt or "tin nhắn đã bị xóa" in txt:
+                continue
 
-            del_item = page.locator('[role="menuitem"]:has-text("Delete"), [data-tid*="delete"]')
+            body_el = msg_el.locator(".fui-ChatMyMessage__body").first
+            body_el.scroll_into_view_if_needed(timeout=3000)
+            body_el.click(button="right", timeout=3000)
+            page.wait_for_timeout(700)
+
+            del_item = page.locator('[data-tid="message-actions-delete"], [role="menuitem"]:has-text("Delete")')
             if del_item.count() > 0 and del_item.first.is_visible():
                 del_item.first.click(timeout=3000)
                 page.wait_for_timeout(1500)
@@ -588,51 +622,48 @@ def _delete_latest_bot_message(page) -> bool:
 
 
 def _get_latest_chat_message(page, chat_name: str = "") -> tuple[str, str]:
-    """Scroll to the bottom of the Teams chat and return (msg_hash, msg_text) of the newest message."""
-    # 1. Scroll virtualized chat list and all scrollable ancestors to the bottom so Teams mounts the newest message
+    """Scroll to the bottom of the Teams chat pane using center mouse wheel and return (msg_hash, msg_text)."""
+    # 1. Always scroll virtualized chat list at the center of the chat pane (x=650, y=400)
     try:
-        page.evaluate(
-            """() => {
-                document.querySelectorAll('[data-tid*="message-pane"], [data-tid*="virtual"], [role="log"], .fui-Chat').forEach(el => {
-                    el.scrollTop = el.scrollHeight;
-                });
-                const msgs = document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body');
-                if (msgs.length > 0) {
-                    const last = msgs[msgs.length - 1];
-                    last.scrollIntoView({ block: 'end' });
-                    let p = last.parentElement;
-                    while (p) {
-                        if (p.scrollHeight > p.clientHeight) {
-                            p.scrollTop = p.scrollHeight;
-                        }
-                        p = p.parentElement;
-                    }
-                }
-                const jumpBtn = document.querySelector('[data-tid*="jump-to-bottom"], [data-tid*="new-messages"], button[aria-label*="new message"]');
-                if (jumpBtn) jumpBtn.click();
-            }"""
-        )
+        jump_btn = page.locator('[data-tid*="jump-to-bottom"], [data-tid*="new-messages"], button[aria-label*="new message"]')
+        if jump_btn.count() > 0 and jump_btn.first.is_visible():
+            jump_btn.first.click(timeout=2000)
+            page.wait_for_timeout(300)
+
+        page.mouse.move(650, 400)
+        for _ in range(4):
+            page.mouse.wheel(0, 8000)
+            page.wait_for_timeout(120)
     except Exception:
         pass
 
-    pane_text = ""
-    pane_count = 0
-    selectors = [
-        '[data-tid="chat-pane-message"]',
-        '[data-tid="messageBodyContent"]',
-        '.fui-ChatMessage__body',
-    ]
-    for sel in selectors:
-        loc = page.locator(sel)
-        count = loc.count()
-        if count > 0:
-            pane_count = count
-            pane_text = loc.nth(count - 1).inner_text(timeout=5000).strip()
-            if pane_text:
-                break
+    # 2. Extract the newest non-empty message from the chat pane (stripping quoted reply blocks so quotes don't confuse triggers)
+    try:
+        latest = page.evaluate(
+            """() => {
+                const items = Array.from(document.querySelectorAll('[data-tid="chat-pane-message"], .fui-ChatMessage__body, .fui-ChatMyMessage__body'));
+                for (let i = items.length - 1; i >= Math.max(0, items.length - 6); i--) {
+                    const el = items[i];
+                    const clone = el.cloneNode(true);
+                    clone.querySelectorAll('[data-tid*="quoted-reply"], blockquote, [role="blockquote"], [data-tid*="reaction"]').forEach(q => q.remove());
+                    const text = (clone.innerText || '').trim();
+                    if (text) {
+                        const isBot = !!el.closest('.fui-ChatMyMessage');
+                        const domId = el.id || (el.closest('[id]') ? el.closest('[id]').id : '') || String(i);
+                        return { text: isBot ? ('[BOT] ' + text) : text, domId: domId, idx: i };
+                    }
+                }
+                return null;
+            }"""
+        )
+        if latest and latest.get("text"):
+            txt = latest["text"]
+            msg_hash = hashlib.sha256(f"pane:{latest['domId']}:{latest['idx']}:{txt}".encode("utf-8")).hexdigest()[:16]
+            return msg_hash, txt
+    except Exception:
+        pass
 
-    # 2. Check the left sidebar chat preview (which ALWAYS updates in real time on every new message, including our bot's own reply!)
-    sidebar_text = ""
+    # 2. Fallback to left sidebar chat preview only if chat pane is empty
     if chat_name:
         try:
             items = page.locator('[role="treeitem"]')
@@ -642,30 +673,17 @@ def _get_latest_chat_message(page, chat_name: str = "") -> tuple[str, str]:
                     lines = [
                         ln.strip()
                         for ln in t.splitlines()
-                        if ln.strip()
-                        and ln.strip().lower() != "unread"
-                        and not re.match(r"^(\d{1,2}:\d{2}(\s*[AP]M)?|just now|yesterday)$", ln.strip(), flags=re.IGNORECASE)
+                        if ln.strip() and ln.strip().lower() != "unread"
                     ]
                     for idx, ln in enumerate(lines):
                         if chat_name.lower() in ln.lower():
-                            # Take the message preview line immediately following the chat title
-                            preview_lines = lines[idx + 1 : idx + 2]
+                            preview_lines = lines[idx + 1 : idx + 3]
                             sidebar_text = " ".join(preview_lines).strip()
-                            break
-                    if sidebar_text:
-                        break
+                            if sidebar_text:
+                                msg_hash = hashlib.sha256(f"sidebar:{sidebar_text}".encode("utf-8")).hexdigest()[:16]
+                                return msg_hash, sidebar_text
         except Exception:
             pass
-
-    # Always prefer sidebar_text when available so that when the bot replies ("You: 🌊 Vitamin..."),
-    # msg_hash changes to the bot's reply hash, allowing the very next !girl command to be detected as new!
-    if sidebar_text:
-        msg_hash = hashlib.sha256(f"sidebar:{sidebar_text}".encode("utf-8")).hexdigest()[:16]
-        return msg_hash, sidebar_text
-
-    if pane_text:
-        msg_hash = hashlib.sha256(f"{pane_count}:{pane_text}".encode("utf-8")).hexdigest()[:16]
-        return msg_hash, pane_text
 
     return "", ""
 
@@ -758,25 +776,33 @@ def _ensure_session_file() -> None:
 def _open_target_chat(page, chat_name: str) -> None:
     """Wait for Teams Web to load and select chat_name (or use the already-open active chat from session)."""
     print("⏳ Waiting for Teams Web interface to load...")
-    page.wait_for_timeout(8000)
+    compose = page.locator('[role="textbox"][contenteditable="true"]')
+    try:
+        compose.first.wait_for(state="visible", timeout=15000)
+        page.wait_for_timeout(1500)
+    except Exception:
+        pass
 
-    if chat_name:
+    # Check if compose box is already active (Teams remembers last open chat ID 19:1ed6928a...@thread.v2 even when members rename the group!)
+    if compose.count() > 0:
+        header = page.locator('[data-tid="chat-title-name-group-chat"]')
+        active_title = header.first.inner_text(timeout=2000).strip() if header.count() > 0 else chat_name
+        print(f"✅ Active group chat is already open: '{active_title}'")
+        return
+
+    for candidate in (chat_name, "Hội sinh viên", "Bảo vệ Ép"):
+        if not candidate:
+            continue
         try:
-            page.get_by_text(chat_name, exact=False).first.click(timeout=15000)
-            print(f"✅ Clicked chat matching '{chat_name}'")
+            page.get_by_text(candidate, exact=False).first.click(timeout=3000)
+            print(f"✅ Clicked chat matching '{candidate}'")
             page.wait_for_timeout(2000)
             return
         except Exception:
-            print(f"ℹ️ Could not find chat title '{chat_name}' in sidebar; checking if chat compose box is already open...")
+            pass
 
-    # Check if compose box is already active (Teams remembers last open chat 19:1ed6928a...@thread.v2 in localStorage!)
-    compose = page.locator('[role="textbox"][contenteditable="true"]')
-    if compose.count() > 0:
-        print("✅ Active chat compose box is already open!")
-        return
-
-    # Otherwise click the first chat item in the left sidebar
-    first_chat = page.locator('[role="treeitem"], [data-tid*="chat-list-item"]').first
+    # Otherwise click the first chat item under Chats in the left sidebar
+    first_chat = page.locator('[role="treeitem"], [data-tid*="chat-list-item"]').nth(3)
     first_chat.click(timeout=15000)
     page.wait_for_timeout(2000)
     print("✅ Clicked first chat in sidebar!")
@@ -851,7 +877,10 @@ def listen_for_mentions(
                 # 1. Check if someone typed !remove, !girl, !nsfw, !leetcode, or tagged @Weather Bot in the chat
                 msg_hash, msg_text = _get_latest_chat_message(page, chat_name)
                 if msg_hash and msg_hash != last_replied:
-                    if is_remove_command(msg_text):
+                    if msg_text.startswith("[BOT] "):
+                        last_replied = msg_hash
+                        LAST_REPLIED_FILE.write_text(last_replied)
+                    elif is_remove_command(msg_text):
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🗑️ Detected !remove command: {msg_text!r}")
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
@@ -927,6 +956,7 @@ def listen_for_mentions(
                         print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Replied with live weather!")
                     else:
                         # Update last_replied when a normal message or our own bot reply becomes the latest message
+                        print(f"[{datetime.now(VN_TZ).isoformat()}] 💬 Seen new message: {msg_text[:80]!r}")
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
 
