@@ -1,12 +1,3 @@
-​#!/usr/bin/env python3
-"""
-Send Weather Alerts & Reply to @Mentions for TTC (Tan Thuan Tower) & FPT Software TP.HCM
-in MS Teams External Chat using a Free Personal @outlook.com Account.
-
-Can run 24/7 on Free Cloud (Hugging Face Spaces / Render / Koyeb / GitHub Actions)
-without needing Power Automate or your local PC!
-"""
-
 import argparse
 import base64
 import hashlib
