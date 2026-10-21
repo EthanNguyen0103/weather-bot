@@ -86,7 +86,6 @@ def format_multi_location_message(results: list, triggered_by: str = "") -> str:
             )
         lines.append("")
 
-    lines.append("🔔 Tip: Tag @Weather Bot (or type !weather, !weather ttc, !weather fpt) anytime for a live update!")
     return "\n".join(lines)
 
 
