@@ -41,10 +41,13 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: Restore seen photos history (prevent duplicates across runs)
+      - name: Restore seen photos & LeetCode history (prevent duplicates across runs)
         uses: actions/cache/restore@v4
         with:
-          path: .seen_vitamin_photos.txt
+          path: |
+            .seen_vitamin_photos.txt
+            .seen_leetcode.txt
+            .last_leetcode_problem.json
           key: seen-photos-${{ github.run_id }}
           restore-keys: |
             seen-photos-
@@ -62,11 +65,14 @@ jobs:
             python3 teams_web_sender.py --listen --max-minutes 345
           fi
 
-      - name: Save seen photos history
+      - name: Save seen photos & LeetCode history
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .seen_vitamin_photos.txt
+          path: |
+            .seen_vitamin_photos.txt
+            .seen_leetcode.txt
+            .last_leetcode_problem.json
           key: seen-photos-${{ github.run_id }}
 
       - name: Auto-restart next 6h listener session (24/7 continuous loop)
@@ -76,4 +82,3 @@ jobs:
         run: |
           echo "🔄 Triggering next 6-hour listener run automatically..."
           gh workflow run weather_alert.yml --ref ${{ github.ref_name }}
- 
