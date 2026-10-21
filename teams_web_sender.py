@@ -18,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from leetcode_helper import handle_leetcode_command, is_leetcode_command
 from weather_bot import LOCATIONS, fetch_all_locations
 
 SESSION_FILE = Path(__file__).parent / "teams_session.json"
@@ -590,7 +591,7 @@ def listen_for_mentions(
         _open_target_chat(page, chat_name)
 
         print(
-            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !vitaminSea)..."
+            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !vitaminSea, !leetcode)..."
             if not one_shot
             else f"🔍 Checking for new @mentions..."
         )
@@ -599,7 +600,7 @@ def listen_for_mentions(
 
         while True:
             try:
-                # 1. Check if someone typed !vitaminSea / !girl or tagged @Weather Bot in the chat
+                # 1. Check if someone typed !vitaminSea / !girl, !leetcode, or tagged @Weather Bot in the chat
                 msg_hash, msg_text = _get_latest_chat_message(page, chat_name)
                 if msg_hash and msg_hash != last_replied:
                     if is_vitamin_sea_command(msg_text):
@@ -623,6 +624,17 @@ def listen_for_mentions(
                                 last_replied = new_hash
                                 LAST_REPLIED_FILE.write_text(last_replied)
                             print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent VOZ photo ({img_url})!")
+                    elif is_leetcode_command(msg_text):
+                        print(f"[{datetime.now(VN_TZ).isoformat()}] 🧩 Detected !leetcode command: {msg_text!r}")
+                        last_replied = msg_hash
+                        LAST_REPLIED_FILE.write_text(last_replied)
+                        lc_reply = handle_leetcode_command(msg_text)
+                        _send_text_in_page(page, lc_reply)
+                        new_hash, _ = _get_latest_chat_message(page, chat_name)
+                        if new_hash:
+                            last_replied = new_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                        print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Replied with LeetCode challenge/solution!")
                     elif is_bot_mentioned(msg_text, bot_name):
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🔔 Detected bot tag: {msg_text!r}")
                         last_replied = msg_hash
