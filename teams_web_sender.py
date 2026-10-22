@@ -102,6 +102,7 @@ def is_vitamin_sea_command(msg_text: str) -> bool:
 
 
 def is_nsfw_command(msg_text: str) -> bool:
+    return False
     """Check if a chat message requests !nsfw or !cosplay."""
     lower = msg_text.lower().strip()
     if "🔥 vitamin cosplay" in lower or "tiếp thêm năng lượng" in lower:
