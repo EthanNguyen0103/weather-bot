@@ -2,6 +2,7 @@ import argparse
 import base64
 import hashlib
 import os
+import re
 import sys
 import threading
 import time
@@ -473,6 +474,201 @@ def fetch_cosplay_photo(context=None) -> tuple[bytes, str]:
     raise RuntimeError("Could not fetch a new unseen Cosplay photo.")
 
 
+def parse_cosplay_search_keyword(msg_text: str) -> str:
+    """Extract keyword from `!cosplay -s "hot"` / `!cosplay -s hot` / `!nsfw --search "raiden shogun"` (empty if no search)."""
+    m = re.search(
+        r"(?:^|\s)(?:-s|--search)\s+[\"“'‘]?(.+?)[\"”'’]?\s*$",
+        msg_text.strip(),
+        flags=re.IGNORECASE,
+    )
+    return m.group(1).strip()[:60] if m else ""
+
+
+_COSPLAY_POST_IMAGES_JS = """() => {
+    const raw = [];
+    document.querySelectorAll('.entry-content img, .gallery-icon img, figure img, .box-image img').forEach(img => {
+        const cls = (img.className || '').toString().toLowerCase();
+        if (cls.includes('avatar') || cls.includes('emoji') || cls.includes('logo') || cls.includes('icon')) return;
+        if (img.closest('.avatar, [class*="avatar"], .author-box, .comments-area, header, footer, .related, .related-posts')) return;
+        const w = parseInt(img.getAttribute('width') || '0', 10) || img.naturalWidth || 0;
+        const h = parseInt(img.getAttribute('height') || '0', 10) || img.naturalHeight || 0;
+        if ((w > 0 && w < 220) || (h > 0 && h < 220)) return;
+        const u = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('src') || img.src || '';
+        if (u) {
+            raw.push(u.replace(/-\\\\d+x\\\\d+(?=\\\\.(jpg|jpeg|png|webp))/i, ''));
+            raw.push(u);
+        }
+    });
+    return [...new Set(raw.filter(u => {
+        const low = u.toLowerCase();
+        return low.startsWith('http') && !low.includes('avatar') && !low.includes('gravatar')
+            && !low.includes('logo') && !low.includes('favicon') && !low.includes('data:image')
+            && !low.endsWith('.gif') && !low.endsWith('.svg');
+    }))];
+}"""
+
+_COSPLAY_POST_LINKS_JS = """() => {
+    let anchors = Array.from(document.querySelectorAll('#main .post-item a, #main article a, .post-item a, article a'));
+    if (!anchors.length) anchors = Array.from(document.querySelectorAll('a'));
+    const links = anchors.map(a => a.href || '').filter(h =>
+        h.startsWith('https://cosplaytele.com/')
+        && !h.includes('/category/') && !h.includes('/tag/') && !h.includes('/page/')
+        && !h.includes('/wp-') && !h.includes('#') && !h.includes('?s=') && !h.includes('/author/')
+        && h.length > 28
+    );
+    return [...new Set(links)];
+}"""
+
+
+def fetch_cosplay_search_photo(context, keyword: str) -> tuple[bytes, str]:
+    """Search cosplaytele.com for `keyword` and return an image never sent before (dedup by URL + content hash, even for repeated keywords)."""
+    import json
+    import random
+    import urllib.parse
+    import urllib.request
+
+    seen = _load_seen_photos()
+    q = urllib.parse.quote_plus(keyword)
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    headers = {"User-Agent": ua, "Referer": "https://cosplaytele.com/"}
+
+    def _mark_post_exhausted(post_url: str) -> None:
+        key = f"post-exhausted:{post_url}"
+        seen.add(key)
+        with SEEN_PHOTOS_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{key}\n")
+
+    # 1. Primary: cosplaytele.com/?s=keyword search pages via Playwright (walk pages 1..4, skip already exhausted albums)
+    if context is not None:
+        cp_page = None
+        try:
+            cp_page = context.new_page()
+            for page_no in range(1, 5):
+                search_url = (
+                    f"https://cosplaytele.com/?s={q}"
+                    if page_no == 1
+                    else f"https://cosplaytele.com/page/{page_no}/?s={q}"
+                )
+                cp_page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+                cp_page.wait_for_timeout(1200)
+                post_links = [
+                    u for u in cp_page.evaluate(_COSPLAY_POST_LINKS_JS) if f"post-exhausted:{u}" not in seen
+                ]
+                if not post_links:
+                    continue
+                random.shuffle(post_links)
+                for post_url in post_links[:4]:
+                    cp_page.goto(post_url, wait_until="domcontentloaded", timeout=20000)
+                    cp_page.wait_for_timeout(1000)
+                    img_urls = cp_page.evaluate(_COSPLAY_POST_IMAGES_JS)
+                    unseen_urls = [u for u in img_urls if u not in seen]
+                    random.shuffle(unseen_urls)
+                    for candidate_url in unseen_urls[:8]:
+                        try:
+                            resp = cp_page.request.get(
+                                candidate_url, headers={"Referer": "https://cosplaytele.com/"}, timeout=12000
+                            )
+                            if resp.ok:
+                                body = resp.body()
+                                img_hash = hashlib.sha256(body).hexdigest()[:24]
+                                if len(body) > 35000 and img_hash not in seen:
+                                    _record_seen_photo(candidate_url, body, seen)
+                                    return body, candidate_url
+                        except Exception:
+                            continue
+                    if not unseen_urls:
+                        _mark_post_exhausted(post_url)
+        except Exception as e:
+            print(f"Warning searching CosplayTele for {keyword!r}: {e}", file=sys.stderr)
+        finally:
+            if cp_page is not None and not cp_page.is_closed():
+                try:
+                    cp_page.close()
+                except Exception:
+                    pass
+
+    # 2. Fallback: WordPress REST API search (/wp-json/wp/v2/posts?search=keyword)
+    for wp_page in range(1, 4):
+        try:
+            wp_url = f"https://cosplaytele.com/wp-json/wp/v2/posts?search={q}&per_page=10&page={wp_page}"
+            req = urllib.request.Request(wp_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                posts = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            if not posts:
+                break
+            random.shuffle(posts)
+            for post in posts:
+                rendered = post.get("content", {}).get("rendered", "")
+                found = re.findall(r'https://[^\s"\'<>]+?\.(?:jpg|jpeg|png)', rendered, flags=re.IGNORECASE)
+                unseen_wp = [u for u in dict.fromkeys(found) if u not in seen and "logo" not in u.lower()]
+                random.shuffle(unseen_wp)
+                for candidate_url in unseen_wp[:8]:
+                    try:
+                        img_req = urllib.request.Request(candidate_url, headers=headers)
+                        with urllib.request.urlopen(img_req, timeout=10) as img_resp:
+                            body = img_resp.read()
+                        img_hash = hashlib.sha256(body).hexdigest()[:24]
+                        if len(body) > 15000 and img_hash not in seen:
+                            _record_seen_photo(candidate_url, body, seen)
+                            return body, candidate_url
+                    except Exception:
+                        continue
+        except Exception:
+            break
+
+    raise RuntimeError(f"No new unseen cosplay photo found for {keyword!r}.")
+
+
+_LIKE_BUTTON_SELECTORS = (
+    '[data-tid="diverse-reaction-like"], [data-tid*="reaction-like"], [data-tid*="quick-reaction-like"], '
+    'button[aria-label^="Like"], button[aria-label*="Like reaction"], [role="menuitem"][aria-label^="Like"], '
+    'button[aria-label*="Thích"], [role="menuitem"][aria-label*="Thích"]'
+)
+
+
+def _react_like_to_latest_command(page, timeout_sec: float = 3.0) -> bool:
+    """React 👍 Like on the newest message from another user (the command the bot is about to handle)."""
+    deadline = time.time() + timeout_sec
+    bodies = page.locator(".fui-ChatMessage__body")
+    try:
+        total = bodies.count()
+        if total == 0:
+            return False
+        target = bodies.nth(total - 1)
+        target.scroll_into_view_if_needed(timeout=800)
+    except Exception:
+        return False
+
+    like_btn = page.locator(_LIKE_BUTTON_SELECTORS).first
+
+    # Attempt 1: hover the message → Teams shows the quick reaction bar → click 👍
+    try:
+        target.hover(position={"x": 20, "y": 10}, timeout=800, force=True)
+        like_btn.wait_for(state="visible", timeout=900)
+        like_btn.click(timeout=800)
+        page.wait_for_timeout(250)
+        return True
+    except Exception:
+        pass
+
+    if time.time() >= deadline:
+        return False
+
+    # Attempt 2: right-click the message → context menu reaction row → click 👍
+    try:
+        target.click(button="right", position={"x": 20, "y": 10}, timeout=800, force=True)
+        like_btn.wait_for(state="visible", timeout=900)
+        like_btn.click(timeout=800)
+        page.wait_for_timeout(250)
+        return True
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+    return False
+
+
 def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
     """Paste an image directly into the Teams chat compose box and click the Send button."""
     compose = page.locator('[role="textbox"][contenteditable="true"]').first
@@ -911,6 +1107,7 @@ def listen_for_mentions(
                         else:
                             print(f"[{datetime.now(VN_TZ).isoformat()}] 🗑️ Detected !remove command: {msg_text!r}")
                             last_remove_ts = time.time()
+                            _react_like_to_latest_command(page, timeout_sec=2.0)
                             deleted = _delete_latest_bot_message(page, timeout_sec=3.5)
                             new_hash, _ = _get_latest_chat_message(page, chat_name)
                             if new_hash:
@@ -931,6 +1128,7 @@ def listen_for_mentions(
                             print(f"[{datetime.now(VN_TZ).isoformat()}] 🌊 Detected !girl / !vitaminSea command: {msg_text!r}")
                             last_replied = msg_hash
                             LAST_REPLIED_FILE.write_text(last_replied)
+                            _react_like_to_latest_command(page)
                             img_bytes, img_url = fetch_vitamin_sea_photo(context)
                             caption = "🌊 Vitamin Gái Xinh VOZ tiếp thêm năng lượng code cho anh em! ✨"
                             _send_image_in_page(page, img_bytes, caption)
@@ -952,9 +1150,20 @@ def listen_for_mentions(
                             print(f"[{datetime.now(VN_TZ).isoformat()}] 🔥 Detected !nsfw / !cosplay command: {msg_text!r}")
                             last_replied = msg_hash
                             LAST_REPLIED_FILE.write_text(last_replied)
-                            img_bytes, img_url = fetch_cosplay_photo(context)
-                            caption = "🔥 Vitamin Cosplay tiếp thêm năng lượng code cho anh em! ✨"
-                            _send_image_in_page(page, img_bytes, caption)
+                            _react_like_to_latest_command(page)
+                            keyword = parse_cosplay_search_keyword(msg_text)
+                            try:
+                                if keyword:
+                                    img_bytes, img_url = fetch_cosplay_search_photo(context, keyword)
+                                    caption = f"🔥 Cosplay '{keyword}' tiếp thêm năng lượng code cho anh em! ✨"
+                                else:
+                                    img_bytes, img_url = fetch_cosplay_photo(context)
+                                    caption = "🔥 Vitamin Cosplay tiếp thêm năng lượng code cho anh em! ✨"
+                                _send_image_in_page(page, img_bytes, caption)
+                            except RuntimeError as e:
+                                print(f"[{datetime.now(VN_TZ).isoformat()}] ⚠️ {e}")
+                                img_url = ""
+                                _send_text_in_page(page, f"😢 Hết ảnh mới cho '{keyword}' rồi, thử từ khóa khác nhé!")
                             last_vitamin_ts = time.time()
                             new_hash, _ = _get_latest_chat_message(page, chat_name)
                             if new_hash:
@@ -965,6 +1174,7 @@ def listen_for_mentions(
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🧩 Detected !leetcode command: {msg_text!r}")
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
+                        _react_like_to_latest_command(page)
                         lc_reply = handle_leetcode_command(msg_text)
                         _send_text_in_page(page, lc_reply)
                         new_hash, _ = _get_latest_chat_message(page, chat_name)
@@ -976,6 +1186,7 @@ def listen_for_mentions(
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🔔 Detected bot tag: {msg_text!r}")
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
+                        _react_like_to_latest_command(page)
                         locs = filter_locations_from_query(msg_text)
                         results = fetch_all_locations(locs)
                         reply = format_multi_location_message(results, triggered_by="On-demand reply")
