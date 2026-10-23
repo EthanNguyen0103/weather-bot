@@ -21,6 +21,7 @@ from pathlib import Path
 
 from job_helper import handle_job_command, is_job_command
 from leetcode_helper import handle_leetcode_command, is_leetcode_command
+from redgifs_helper import fetch_redgifs_gif, is_gif_command, parse_gif_command
 from weather_bot import LOCATIONS, fetch_all_locations
 
 SESSION_FILE = Path(__file__).parent / "teams_session.json"
@@ -646,32 +647,38 @@ def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
         pass
 
     b64_img = base64.b64encode(img_bytes).decode("ascii")
-    # Normalize any PNG/WebP/large 4K image into a clean <=1280px JPEG (~150KB) via Canvas and paste into Teams compose box
+    # Normalize images: if animated GIF keep as image/gif; if PNG/WebP/large 4K JPEG normalize to <=1280px JPEG via Canvas
     compose.evaluate(
         """async (el, b64) => {
             const bin = atob(b64);
             const arr = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
             let blob = new Blob([arr]);
-            try {
-                const bmp = await createImageBitmap(blob);
-                const maxDim = 1280;
-                let w = bmp.width, h = bmp.height;
-                if (w > maxDim || h > maxDim) {
-                    if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
-                    else { w = Math.round(w * maxDim / h); h = maxDim; }
+            const isGif = arr.length > 3 && arr[0] === 71 && arr[1] === 73 && arr[2] === 70; // 'GIF'
+            let file;
+            if (isGif) {
+                file = new File([blob], "animation.gif", { type: "image/gif" });
+            } else {
+                try {
+                    const bmp = await createImageBitmap(blob);
+                    const maxDim = 1280;
+                    let w = bmp.width, h = bmp.height;
+                    if (w > maxDim || h > maxDim) {
+                        if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+                        else { w = Math.round(w * maxDim / h); h = maxDim; }
+                    }
+                    const canvas = document.createElement("canvas");
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext("2d");
+                    ctx.drawImage(bmp, 0, 0, w, h);
+                    const jpegBlob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.88));
+                    if (jpegBlob) blob = jpegBlob;
+                } catch (e) {
+                    blob = new Blob([arr], { type: "image/jpeg" });
                 }
-                const canvas = document.createElement("canvas");
-                canvas.width = w;
-                canvas.height = h;
-                const ctx = canvas.getContext("2d");
-                ctx.drawImage(bmp, 0, 0, w, h);
-                const jpegBlob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.88));
-                if (jpegBlob) blob = jpegBlob;
-            } catch (e) {
-                blob = new Blob([arr], { type: "image/jpeg" });
+                file = new File([blob], "vitamin_sea.jpg", { type: "image/jpeg" });
             }
-            const file = new File([blob], "vitamin_sea.jpg", { type: "image/jpeg" });
             const dt = new DataTransfer();
             dt.items.add(file);
             const evt = new ClipboardEvent("paste", {
@@ -1043,7 +1050,7 @@ def listen_for_mentions(
         _open_target_chat(page, chat_name)
 
         print(
-            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !nsfw, !remove, !leetcode, !job)..."
+            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !nsfw, !gif, !remove, !leetcode, !job)..."
             if not one_shot
             else f"🔍 Checking for new @mentions..."
         )
@@ -1126,6 +1133,30 @@ def listen_for_mentions(
                                 last_replied = new_hash
                                 LAST_REPLIED_FILE.write_text(last_replied)
                             print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent Cosplay photo ({img_url})!")
+                    elif is_gif_command(msg_text):
+                        elapsed = time.time() - last_vitamin_ts
+                        if elapsed < vitamin_cooldown_sec:
+                            wait_left = int(vitamin_cooldown_sec - elapsed)
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] ⏳ Anti-spam cooldown active ({wait_left}s left), ignoring !gif.")
+                            last_replied = msg_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                        else:
+                            print(f"[{datetime.now(VN_TZ).isoformat()}] 🎬 Detected !gif command: {msg_text!r}")
+                            last_replied = msg_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                            keyword = parse_gif_command(msg_text)
+                            try:
+                                gif_bytes, gif_url, caption = fetch_redgifs_gif(context, keyword)
+                                _send_image_in_page(page, gif_bytes, caption)
+                                print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent RedGifs GIF ({gif_url})!")
+                            except RuntimeError as e:
+                                print(f"[{datetime.now(VN_TZ).isoformat()}] ⚠️ {e}")
+                                _send_text_in_page(page, f"😢 Không tìm thấy GIF mới trên RedGifs cho '{keyword}' rồi!")
+                            last_vitamin_ts = time.time()
+                            new_hash, _ = _get_latest_chat_message(page, chat_name)
+                            if new_hash:
+                                last_replied = new_hash
+                                LAST_REPLIED_FILE.write_text(last_replied)
                     elif is_job_command(msg_text):
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 💼 Detected !job command: {msg_text!r}")
                         last_replied = msg_hash
