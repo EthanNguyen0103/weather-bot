@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+"""
+Send Weather Alerts & Reply to @Mentions for TTC (Tan Thuan Tower) & FPT Software TP.HCM
+in MS Teams External Chat using a Free Personal @outlook.com Account.
+
+Can run 24/7 on Free Cloud (Hugging Face Spaces / Render / Koyeb / GitHub Actions)
+without needing Power Automate or your local PC!
+"""
+
 import argparse
 import base64
 import hashlib
@@ -10,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from job_helper import handle_job_command, is_job_command
 from leetcode_helper import handle_leetcode_command, is_leetcode_command
 from weather_bot import LOCATIONS, fetch_all_locations
 
@@ -419,7 +429,7 @@ def fetch_cosplay_photo(context=None) -> tuple[bytes, str]:
             random.shuffle(posts)
             for post in posts[:3]:
                 rendered = post.get("content", {}).get("rendered", "")
-                found = re.findall(r'https://[^\s"\'<>]+?\.(?:jpg|jpeg|png)', rendered, flags=re.IGNORECASE)
+                found = re.findall(r'https://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp)', rendered, flags=re.IGNORECASE)
                 unseen_wp = [u for u in found if u not in seen and "logo" not in u.lower()]
                 random.shuffle(unseen_wp)
                 for candidate_url in unseen_wp[:8]:
@@ -495,7 +505,7 @@ _COSPLAY_POST_IMAGES_JS = """() => {
         if ((w > 0 && w < 220) || (h > 0 && h < 220)) return;
         const u = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('src') || img.src || '';
         if (u) {
-            raw.push(u.replace(/-\\\\d+x\\\\d+(?=\\\\.(jpg|jpeg|png|webp))/i, ''));
+            raw.push(u.replace(/-\\d+x\\d+(?=\\.(jpg|jpeg|png|webp))/i, ''));
             raw.push(u);
         }
     });
@@ -508,8 +518,8 @@ _COSPLAY_POST_IMAGES_JS = """() => {
 }"""
 
 _COSPLAY_POST_LINKS_JS = """() => {
-    let anchors = Array.from(document.querySelectorAll('#main .post-item a, #main article a, .post-item a, article a'));
-    if (!anchors.length) anchors = Array.from(document.querySelectorAll('a'));
+    // Only real results inside #post-list (the footer slider widget also uses .post-item on every page, incl. "Nothing Found")
+    const anchors = Array.from(document.querySelectorAll('#post-list .post-item a'));
     const links = anchors.map(a => a.href || '').filter(h =>
         h.startsWith('https://cosplaytele.com/')
         && !h.includes('/category/') && !h.includes('/tag/') && !h.includes('/page/')
@@ -551,9 +561,10 @@ def fetch_cosplay_search_photo(context, keyword: str) -> tuple[bytes, str]:
                 )
                 cp_page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
                 cp_page.wait_for_timeout(1200)
-                post_links = [
-                    u for u in cp_page.evaluate(_COSPLAY_POST_LINKS_JS) if f"post-exhausted:{u}" not in seen
-                ]
+                raw_links = cp_page.evaluate(_COSPLAY_POST_LINKS_JS)
+                if not raw_links:
+                    break  # "Nothing Found" or past the last results page
+                post_links = [u for u in raw_links if f"post-exhausted:{u}" not in seen]
                 if not post_links:
                     continue
                 random.shuffle(post_links)
@@ -599,7 +610,7 @@ def fetch_cosplay_search_photo(context, keyword: str) -> tuple[bytes, str]:
             random.shuffle(posts)
             for post in posts:
                 rendered = post.get("content", {}).get("rendered", "")
-                found = re.findall(r'https://[^\s"\'<>]+?\.(?:jpg|jpeg|png)', rendered, flags=re.IGNORECASE)
+                found = re.findall(r'https://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp)', rendered, flags=re.IGNORECASE)
                 unseen_wp = [u for u in dict.fromkeys(found) if u not in seen and "logo" not in u.lower()]
                 random.shuffle(unseen_wp)
                 for candidate_url in unseen_wp[:8]:
@@ -617,56 +628,6 @@ def fetch_cosplay_search_photo(context, keyword: str) -> tuple[bytes, str]:
             break
 
     raise RuntimeError(f"No new unseen cosplay photo found for {keyword!r}.")
-
-
-_LIKE_BUTTON_SELECTORS = (
-    '[data-tid="diverse-reaction-like"], [data-tid*="reaction-like"], [data-tid*="quick-reaction-like"], '
-    'button[aria-label^="Like"], button[aria-label*="Like reaction"], [role="menuitem"][aria-label^="Like"], '
-    'button[aria-label*="Thích"], [role="menuitem"][aria-label*="Thích"]'
-)
-
-
-def _react_like_to_latest_command(page, timeout_sec: float = 3.0) -> bool:
-    """React 👍 Like on the newest message from another user (the command the bot is about to handle)."""
-    deadline = time.time() + timeout_sec
-    bodies = page.locator(".fui-ChatMessage__body")
-    try:
-        total = bodies.count()
-        if total == 0:
-            return False
-        target = bodies.nth(total - 1)
-        target.scroll_into_view_if_needed(timeout=800)
-    except Exception:
-        return False
-
-    like_btn = page.locator(_LIKE_BUTTON_SELECTORS).first
-
-    # Attempt 1: hover the message → Teams shows the quick reaction bar → click 👍
-    try:
-        target.hover(position={"x": 20, "y": 10}, timeout=800, force=True)
-        like_btn.wait_for(state="visible", timeout=900)
-        like_btn.click(timeout=800)
-        page.wait_for_timeout(250)
-        return True
-    except Exception:
-        pass
-
-    if time.time() >= deadline:
-        return False
-
-    # Attempt 2: right-click the message → context menu reaction row → click 👍
-    try:
-        target.click(button="right", position={"x": 20, "y": 10}, timeout=800, force=True)
-        like_btn.wait_for(state="visible", timeout=900)
-        like_btn.click(timeout=800)
-        page.wait_for_timeout(250)
-        return True
-    except Exception:
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
-    return False
 
 
 def _send_image_in_page(page, img_bytes: bytes, caption: str) -> None:
@@ -774,67 +735,65 @@ def _send_text_in_page(page, message: str) -> None:
     page.wait_for_timeout(2000)
 
 
-def _delete_latest_bot_message(page, timeout_sec: float = 4.0) -> bool:
-    """Find the bot's most recent sent message (.fui-ChatMyMessage__body), right-click it, and click Delete within timeout_sec."""
-    deadline = time.time() + timeout_sec
+_FIND_LATEST_BOT_MSG_JS = """(skip) => {
+    // Return click coordinates for the newest NOT-yet-deleted bot message, in a single DOM pass (no per-element round trips).
+    const bodies = Array.from(document.querySelectorAll('.fui-ChatMyMessage__body'));
+    let skipped = 0;
+    for (let i = bodies.length - 1; i >= Math.max(0, bodies.length - 6); i--) {
+        const el = bodies[i];
+        const msg = el.closest('.fui-ChatMyMessage') || el;
+        const txt = (msg.innerText || '').toLowerCase();
+        if (txt.includes('has been deleted') || txt.includes('đã bị xóa') || msg.querySelector('[data-tid*="deleted"]')) continue;
+        if (skipped < skip) { skipped++; continue; }
+        el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        const r = el.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) continue;
+        // Click near the top-left corner of the bubble (avoids <img> overlays on photo messages)
+        return { x: r.left + Math.min(16, r.width / 2), y: r.top + Math.min(10, r.height / 2) };
+    }
+    return null;
+}"""
 
-    # Quick scroll at center of chat pane to make sure bottom messages are mounted
+_DELETE_MENU_SELECTOR = (
+    '[data-tid="message-actions-delete"], [role="menuitem"]:has-text("Delete"), [role="menuitem"]:has-text("Xóa")'
+)
+
+
+def _delete_latest_bot_message(page, timeout_sec: float = 2.5) -> bool:
+    """Delete the bot's newest message: 1 JS lookup → real right-click → click Delete. Hard-capped at timeout_sec."""
+    deadline = time.time() + timeout_sec
     try:
+        page.keyboard.press("Escape")  # close any stray menu/popup first
         page.mouse.move(650, 400)
         page.mouse.wheel(0, 10000)
-        page.wait_for_timeout(120)
     except Exception:
         pass
 
-    bodies = page.locator(".fui-ChatMyMessage__body")
-    try:
-        total = bodies.count()
-    except Exception:
-        return False
-
-    # Only inspect the last 4 bot message bodies so we never lag scanning old history
-    start_idx = max(0, total - 4)
-    for idx in range(total - 1, start_idx - 1, -1):
+    del_item = page.locator(_DELETE_MENU_SELECTOR).first
+    for skip in range(2):  # newest bot message, then the one before if its menu has no Delete
         if time.time() >= deadline:
             break
         try:
-            body_el = bodies.nth(idx)
-            is_valid = body_el.evaluate(
-                """(el) => {
-                    const msg = el.closest('.fui-ChatMyMessage') || el;
-                    const txt = (msg.innerText || '').toLowerCase();
-                    if (txt.includes('message has been deleted') || txt.includes('tin nhắn đã bị xóa')) {
-                        return false;
-                    }
-                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
-                    return true;
-                }""",
-                timeout=700,
-            )
-            if not is_valid:
-                continue
-
-            page.wait_for_timeout(100)
-            # Right-click near top-left of bubble (x=14, y=10) to avoid hitting center <img> overlays on !girl / !nsfw photos
-            body_el.click(button="right", position={"x": 14, "y": 10}, timeout=800, force=True)
-
-            del_item = page.locator(
-                '[data-tid="message-actions-delete"], [role="menuitem"]:has-text("Delete"), [role="menuitem"]:has-text("Xóa")'
-            ).first
+            pt = page.evaluate(_FIND_LATEST_BOT_MSG_JS, skip)
+            if not pt:
+                return False
+            page.mouse.click(pt["x"], pt["y"], button="right")
+            remaining_ms = max(300, int((deadline - time.time()) * 1000))
+            del_item.wait_for(state="visible", timeout=min(1200, remaining_ms))
+            del_item.click(timeout=800)
+            # Some Teams builds show a confirm dialog — click it without waiting if present
             try:
-                del_item.wait_for(state="visible", timeout=650)
-                del_item.click(timeout=800)
-                page.wait_for_timeout(600)
-                return True
+                confirm = page.locator('[role="dialog"] button:has-text("Delete"), [role="dialog"] button:has-text("Xóa")').first
+                if confirm.is_visible():
+                    confirm.click(timeout=600)
             except Exception:
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(80)
+                pass
+            return True
         except Exception:
             try:
                 page.keyboard.press("Escape")
             except Exception:
                 pass
-            continue
     return False
 
 
@@ -1067,7 +1026,7 @@ def listen_for_mentions(
     last_vitamin_ts = 0.0
     last_remove_ts = 0.0
     vitamin_cooldown_sec = int(os.environ.get("VITAMIN_COOLDOWN_SEC", "15"))
-    remove_cooldown_sec = float(os.environ.get("REMOVE_COOLDOWN_SEC", "4"))
+    remove_cooldown_sec = float(os.environ.get("REMOVE_COOLDOWN_SEC", "2"))
     start_ts = time.time()
 
     with sync_playwright() as p:
@@ -1084,7 +1043,7 @@ def listen_for_mentions(
         _open_target_chat(page, chat_name)
 
         print(
-            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !nsfw, !remove, !leetcode)..."
+            f"👂 Listening for @mentions ('{bot_name}', !weather, !girl, !nsfw, !remove, !leetcode, !job)..."
             if not one_shot
             else f"🔍 Checking for new @mentions..."
         )
@@ -1107,8 +1066,7 @@ def listen_for_mentions(
                         else:
                             print(f"[{datetime.now(VN_TZ).isoformat()}] 🗑️ Detected !remove command: {msg_text!r}")
                             last_remove_ts = time.time()
-                            _react_like_to_latest_command(page, timeout_sec=2.0)
-                            deleted = _delete_latest_bot_message(page, timeout_sec=3.5)
+                            deleted = _delete_latest_bot_message(page, timeout_sec=2.5)
                             new_hash, _ = _get_latest_chat_message(page, chat_name)
                             if new_hash:
                                 last_replied = new_hash
@@ -1128,7 +1086,6 @@ def listen_for_mentions(
                             print(f"[{datetime.now(VN_TZ).isoformat()}] 🌊 Detected !girl / !vitaminSea command: {msg_text!r}")
                             last_replied = msg_hash
                             LAST_REPLIED_FILE.write_text(last_replied)
-                            _react_like_to_latest_command(page)
                             img_bytes, img_url = fetch_vitamin_sea_photo(context)
                             caption = "🌊 Vitamin Gái Xinh VOZ tiếp thêm năng lượng code cho anh em! ✨"
                             _send_image_in_page(page, img_bytes, caption)
@@ -1150,7 +1107,6 @@ def listen_for_mentions(
                             print(f"[{datetime.now(VN_TZ).isoformat()}] 🔥 Detected !nsfw / !cosplay command: {msg_text!r}")
                             last_replied = msg_hash
                             LAST_REPLIED_FILE.write_text(last_replied)
-                            _react_like_to_latest_command(page)
                             keyword = parse_cosplay_search_keyword(msg_text)
                             try:
                                 if keyword:
@@ -1170,11 +1126,21 @@ def listen_for_mentions(
                                 last_replied = new_hash
                                 LAST_REPLIED_FILE.write_text(last_replied)
                             print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Sent Cosplay photo ({img_url})!")
+                    elif is_job_command(msg_text):
+                        print(f"[{datetime.now(VN_TZ).isoformat()}] 💼 Detected !job command: {msg_text!r}")
+                        last_replied = msg_hash
+                        LAST_REPLIED_FILE.write_text(last_replied)
+                        job_reply = handle_job_command(msg_text, context)
+                        _send_text_in_page(page, job_reply)
+                        new_hash, _ = _get_latest_chat_message(page, chat_name)
+                        if new_hash:
+                            last_replied = new_hash
+                            LAST_REPLIED_FILE.write_text(last_replied)
+                        print(f"[{datetime.now(VN_TZ).isoformat()}] ✅ Replied with LinkedIn jobs!")
                     elif is_leetcode_command(msg_text):
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🧩 Detected !leetcode command: {msg_text!r}")
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
-                        _react_like_to_latest_command(page)
                         lc_reply = handle_leetcode_command(msg_text)
                         _send_text_in_page(page, lc_reply)
                         new_hash, _ = _get_latest_chat_message(page, chat_name)
@@ -1186,7 +1152,6 @@ def listen_for_mentions(
                         print(f"[{datetime.now(VN_TZ).isoformat()}] 🔔 Detected bot tag: {msg_text!r}")
                         last_replied = msg_hash
                         LAST_REPLIED_FILE.write_text(last_replied)
-                        _react_like_to_latest_command(page)
                         locs = filter_locations_from_query(msg_text)
                         results = fetch_all_locations(locs)
                         reply = format_multi_location_message(results, triggered_by="On-demand reply")
